@@ -1,0 +1,39 @@
+# Run artifacts
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# SSH multiplex sockets (shouldn't end up here, but just in case)
+.ssh-ctrl/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local notes & scratch (uncomment if you keep these in-repo)
+# NOTES.md
+# scratch/
+# TODO.local.md
+
+# Secrets — never commit
+*.pem
+*.key
+.env
+.env.*
+!.env.example
