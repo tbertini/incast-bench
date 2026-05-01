@@ -2,11 +2,14 @@
 """
 incast-bench.py — Many-sender → one-receiver RoCEv2 incast orchestrator.
 
-Drives an `ib_write_bw` incast experiment across the ETHZ Systems Group
-`alveo-*` cluster, snapshots NIC counters before and after, and produces a
-Markdown report. Single-file, stdlib-only; macOS- and Linux-friendly.
+Drives an `ib_write_bw` incast experiment across a set of Mellanox
+BlueField-3 / ConnectX hosts, snapshots NIC counters before and after, and
+produces a Markdown report. Single-file, stdlib-only; macOS- and
+Linux-friendly.
 
-See README.md for fleet caveats and quickstart.
+Defaults assume a fleet using `mlx5_0` / `data1` and the `rigi-bluefield`
+QoS wrapper on BF3 hosts; both can be adjusted at the top of the file or
+via CLI flags. See README.md for setup and caveats.
 """
 
 from __future__ import annotations
@@ -32,8 +35,9 @@ from typing import Optional
 # =============================================================================
 
 # Identify BlueField-3 hosts by hostname allowlist rather than by SSH-probing.
-# Probing means an extra round-trip per host on startup, and the fleet is
-# small and stable enough that a hardcoded list is the right call here.
+# Probing would mean an extra round-trip per host on startup just to read
+# /sys/class/infiniband/mlx5_0/board_id or similar — a hardcoded list keeps
+# startup fast for stable fleets. Override at the CLI with --bluefield-hosts.
 DEFAULT_BLUEFIELD_HOSTS = ("alveo-u50d-01", "alveo-u50d-02")
 
 DEFAULT_RDMA_DEV = "mlx5_0"
@@ -66,13 +70,14 @@ HEADLINE_COUNTERS = (
 )
 
 SSH_CONNECT_TIMEOUT = 10
-RECEIVER_BIND_DELAY = 4    # see lesson #7 — 2s was empirically too tight
+RECEIVER_BIND_DELAY = 4    # 2s is too tight under load; 4s is a safe floor
 HANDSHAKE_PAD = 30         # extra slack on top of -D for QP setup + teardown
 
 # rigi-bluefield baseline. `set tc-mapping` and `set buffer` are intentionally
-# omitted: they fail on this fleet because the installed `mlnx_qos` predates
-# the `--tc_tsa` flag the rigi script expects, and the default prio→TC mapping
-# is already correct so they were no-ops anyway.
+# omitted: they require a newer `mlnx_qos` than is installed on many fleets
+# (depends on the `--tc_tsa` flag), and the default prio→TC mapping is
+# typically already correct so they were no-ops anyway. Add them here if your
+# fleet needs them.
 RIGI_BASELINE_CMDS = (
     "sudo rigi-bluefield set pfc-prio3",
     "sudo rigi-bluefield set trust-dscp",
@@ -139,8 +144,7 @@ def _ssh_ctrl_dir() -> Path:
 def _strip_motd(text: str) -> str:
     """OpenSSH writes the remote MOTD to stderr alongside any real error.
     On auth failure the genuine reason gets buried under several hundred
-    lines of welcome banner; show only lines that look like diagnostics
-    (lesson #2)."""
+    lines of welcome banner; show only lines that look like diagnostics."""
     keep = re.compile(
         r"(Permission|denied|host key|Could not|refused|@[\w.-]+|"
         r"port \d+:|not known|closed by remote|Bad config|"
@@ -201,7 +205,7 @@ class SSHTarget:
         if r.returncode != 0:
             raise SSHError(self.host, _strip_motd(r.stderr))
         # Verify the master actually works. BatchMode=yes + missing
-        # ssh-agent key (lesson #2) often manifests here, not in -N -f.
+        # ssh-agent key often manifests here, not in -N -f.
         v = subprocess.run(self._base() + ["true"], capture_output=True, text=True)
         if v.returncode != 0:
             raise SSHError(self.host, _strip_motd(v.stderr))
@@ -273,7 +277,7 @@ class Host:
 
 # All three counter sources in one SSH round-trip per host. Mellanox HW
 # counters are read-only monotonic registers — we snapshot before and after
-# and subtract. Don't try to reset (lesson #6: would need a driver reload).
+# and subtract. Don't try to reset (would need a driver reload).
 COUNTER_SCRIPT = (
     r"""
 echo '===ETHTOOL==='
@@ -359,7 +363,7 @@ def diff_counters(pre: dict, post: dict) -> dict:
 def perftest_cmd(port, msg_size, duration, gid_idx, tos, target=None):
     """Build an `ib_write_bw` invocation.
 
-    The non-obvious bits (lesson #3 — the traffic-priority trap):
+    The non-obvious bits (the traffic-priority trap):
       -R         use rdma_cm for QP setup (required for --tos to apply)
       --tos 105  = (DSCP 26 << 2) | 0b01 = ECT(1).  DSCP 26 maps to prio 3
                   via DSCP-trust on the BF3 hosts; ECT(1) makes packets
@@ -609,6 +613,22 @@ def phase_baseline(hosts, failed):
             return h, "skipped (ConnectX)", []
         h.log_section("BASELINE")
         host_failures = []
+
+        # Preflight: ensure Mellanox Software Tools is running. `mst start`
+        # loads the kernel module and creates /dev/mst/mt41692_pciconf0,
+        # which rigi-bluefield's pcc_counters.sh and mlxreg-based commands
+        # need. Typically persists across reboots once started, so this is
+        # a no-op on subsequent runs.
+        mst_check = h.ssh.run("ls /dev/mst/mt*_pciconf0 2>/dev/null", timeout=10)
+        if mst_check.returncode != 0 or not mst_check.stdout.strip():
+            r = h.ssh.run("sudo mst start", timeout=20, tty=True)
+            h.log_append(f"$ sudo mst start\n{r.stdout}{r.stderr}\nrc={r.returncode}")
+            if r.returncode != 0:
+                # If mst isn't installed at all, surface that clearly —
+                # everything else on this host will fail without it.
+                host_failures.append(("sudo mst start", _trim(r.stderr or r.stdout)))
+                return h, f"{red('mst start failed')} (skipping baseline)", host_failures
+
         for cmd in RIGI_BASELINE_CMDS:
             # tty=True: every rigi-bluefield call goes through sudo, and
             # our hosts have `Defaults requiretty` in sudoers. Without -tt
@@ -638,7 +658,7 @@ def phase_baseline(hosts, failed):
         # Daemon present — try to wire up the diag counters. If this fails
         # despite the daemon running, the firmware is in a bad state
         # (e.g. stale registration from a previous session); we surface
-        # that as a real failure since the user expected PCC to work.
+        # that as a real failure since PCC was expected to work.
         r = h.ssh.run(RIGI_PCC_INIT, timeout=30, tty=True)
         h.log_append(f"$ {RIGI_PCC_INIT}\n{r.stdout}{r.stderr}\nrc={r.returncode}")
         if r.returncode == 0:
@@ -699,8 +719,8 @@ def phase_run(receiver, senders, args, mode, failed):
         port = args.base_port + i
         receiver_handles.append(spawn_perftest(receiver, "recv", port, args, target=None))
 
-    # Lesson #7: 2s sleep was empirically too tight — one sender raced past
-    # the bind and got "Couldn't connect". 4s is the floor we settled on.
+    # 4s gives the receivers time to bind and start listening before any
+    # sender tries to connect; 2s was empirically too tight under load.
     print(f"  {dim(f'waiting {RECEIVER_BIND_DELAY}s for receivers to bind...')}")
     time.sleep(RECEIVER_BIND_DELAY)
 
@@ -805,6 +825,8 @@ def _fmt_int(n):
 
 
 def _short(name):
+    # Strip a common prefix to keep table columns narrow. Tweak or remove
+    # if your hostnames don't share a prefix.
     return name.replace("alveo-", "")
 
 
@@ -1007,7 +1029,7 @@ def print_terminal_summary(receiver, senders, run_dir, failed):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="RoCEv2 incast orchestrator for the ETHZ Systems Group alveo-* fleet.",
+        description="RoCEv2 incast orchestrator for Mellanox BF3 / ConnectX fleets.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-r", "--receiver", required=True, help="Receiver hostname")
@@ -1093,7 +1115,7 @@ def run_once(args, bf_set, run_dir, started_at):
         print(red(f"\nUnexpected: {type(e).__name__}: {e}"))
         return 1, {}, None, [], failed
     finally:
-        # Critical cleanup ordering (lesson #1):
+        # Critical cleanup ordering:
         #   1. pkill ib_write_bw on every host so receivers don't outlive
         #      their parent SSH session and block the listen ports next run.
         #   2. THEN tear down ControlMaster.

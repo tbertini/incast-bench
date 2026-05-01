@@ -113,7 +113,10 @@ rdma_cm — the TOS field only takes effect when the QP is set up via the CM.
    `Couldn't bind`.
 3. **Open visibility windows** — one iTerm2 window per host on macOS, or
    interleaved colored output otherwise.
-4. **Apply baseline configuration** on BlueField-3 hosts:
+4. **Apply baseline configuration** on BlueField-3 hosts. First, ensure
+   Mellanox Software Tools is loaded (`sudo mst start` if
+   `/dev/mst/mt*_pciconf0` is missing — typically a one-time-per-boot
+   no-op). Then:
    ```
    sudo rigi-bluefield set pfc-prio3
    sudo rigi-bluefield set trust-dscp
