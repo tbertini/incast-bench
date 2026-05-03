@@ -412,11 +412,13 @@ def run_receiver(host: Host, ports: list[int], args) -> dict[int, PerftestResult
         return {port: fut.result() for port, fut in futures.items()}
 
 
-def run_sender(host: Host, port: int, receiver_addr: str, args) -> PerftestResult:
+def run_sender(host: Host, port: int, receiver_addr: str, args,
+               duration_override: Optional[int] = None) -> PerftestResult:
+    duration = duration_override if duration_override is not None else args.duration
     bw_cmd = (f"ib_write_bw -d {DEFAULT_DEVICE} -x {args.gid_index} -F --report_gbits "
-              f"-D {args.duration} -s {args.msg_size} -p {port} {receiver_addr}")
+              f"-D {duration} -s {args.msg_size} -p {port} {receiver_addr}")
     r = ssh_run(host, bw_cmd, tee_log=True,
-                log_header=f"sender → {receiver_addr}:{port}",
+                log_header=f"sender → {receiver_addr}:{port} (-D {duration})",
                 timeout=args.duration + 60)
     peak, avg, mpps = parse_perftest(r.stdout)
     return PerftestResult(
@@ -532,6 +534,11 @@ def build_report(*, args, hosts: list[Host], receiver: Host,
     lines.append(f"- Senders: " + ", ".join(f"**{s}**" for s in sender_results))
     lines.append(f"- ib_write_bw: `-D {args.duration} -s {args.msg_size} "
                  f"-x {args.gid_index} --report_gbits`")
+    if args.stagger_stop > 0:
+        keep = args.keep_running or list(sender_results)[0]
+        lines.append(f"- Stagger-stop: `{keep}` runs for {args.duration}s; "
+                     f"other senders run for {args.duration - args.stagger_stop}s "
+                     f"(stop {args.stagger_stop}s early)")
     lines.append(f"- Base port: {args.base_port}  →  ports "
                  f"{args.base_port}..{args.base_port + len(sender_results) - 1}")
     lines.append(f"- Wall-clock: {wall_time_s:.1f}s")
@@ -655,7 +662,15 @@ def parse_args():
     ap.add_argument("-s", "--senders", required=True, nargs="+",
                     help="Sender hostnames (e.g. alveo-u50d-01 alveo-u55c-05)")
     ap.add_argument("-D", "--duration", type=int, default=DEFAULT_DURATION,
-                    help="ib_write_bw duration in seconds")
+                    help="ib_write_bw duration in seconds (the longest-running sender)")
+    ap.add_argument("--stagger-stop", type=int, default=0, metavar="SECONDS",
+                    help="Other senders stop SECONDS earlier than --keep-running (0 = all "
+                         "stop together). Useful for testing whether a CC algorithm recovers "
+                         "to line rate after competing flows quit.")
+    ap.add_argument("--keep-running", default="",
+                    help="Hostname of the sender that runs for the full --duration. Other "
+                         "senders run for (duration - stagger-stop) seconds. Default: first "
+                         "host in --senders.")
     ap.add_argument("-S", "--msg-size", type=int, default=DEFAULT_MSG_SIZE,
                     help="ib_write_bw message size in bytes")
     ap.add_argument("-x", "--gid-index", type=int, default=DEFAULT_GID_INDEX,
@@ -771,16 +786,45 @@ def run_one_iteration(args, run_dir: Path, run_idx: int, total_runs: int):
         ports = [args.base_port + i for i in range(len(senders))]
         sender_to_port = dict(zip([s.name for s in senders], ports))
         receiver_addr = receiver.name + DATA_SUFFIX
-        print(f"\n[6/7] Running benchmark: {len(senders)} senders → "
-              f"{receiver.name} ({receiver_addr}), ports {ports[0]}..{ports[-1]}, "
-              f"{args.duration}s + handshake...")
+
+        # Stagger-stop: --keep-running runs for full duration, others run shorter.
+        keep_running = args.keep_running or senders[0].name
+        if keep_running not in {s.name for s in senders}:
+            raise RuntimeError(
+                f"--keep-running '{keep_running}' is not in --senders. "
+                f"Senders: {[s.name for s in senders]}"
+            )
+        short_duration = args.duration - args.stagger_stop
+        if args.stagger_stop > 0 and short_duration < 1:
+            raise RuntimeError(
+                f"--stagger-stop {args.stagger_stop}s is >= --duration {args.duration}s; "
+                f"other senders would never run."
+            )
+        sender_durations = {
+            s.name: args.duration if s.name == keep_running else short_duration
+            for s in senders
+        }
+
+        if args.stagger_stop > 0:
+            others = [n for n, d in sender_durations.items() if d != args.duration]
+            print(f"\n[6/7] Running benchmark: {len(senders)} senders → "
+                  f"{receiver.name} ({receiver_addr}), ports {ports[0]}..{ports[-1]}")
+            print(f"      ↳ {keep_running} runs for {args.duration}s")
+            print(f"      ↳ {others} run for {short_duration}s "
+                  f"(stop {args.stagger_stop}s early)")
+        else:
+            print(f"\n[6/7] Running benchmark: {len(senders)} senders → "
+                  f"{receiver.name} ({receiver_addr}), ports {ports[0]}..{ports[-1]}, "
+                  f"{args.duration}s + handshake...")
+
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=1 + len(senders)) as ex:
             recv_future = ex.submit(run_receiver, receiver, ports, args)
             time.sleep(2)  # let receivers bind
             sender_futures = {
                 s.name: ex.submit(run_sender, s, sender_to_port[s.name],
-                                  receiver_addr, args)
+                                  receiver_addr, args,
+                                  duration_override=sender_durations[s.name])
                 for s in senders
             }
             sender_results = {name: f.result() for name, f in sender_futures.items()}

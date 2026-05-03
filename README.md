@@ -10,17 +10,17 @@ markdown report with throughput and counter deltas.
 ```bash
 # 1. Place the script
 mkdir -p ~/Desktop/incast-bench
-mv incast-bench ~/Desktop/incast-bench/
-chmod +x ~/Desktop/incast-bench/incast-bench
+mv incast-bench.py ~/Desktop/incast-bench/
+chmod +x ~/Desktop/incast-bench/incast-bench.py
 
 # 2. Set up SSH keys (one prompt per host; only needed once)
 ssh-keygen -t ed25519        # skip if you already have ~/.ssh/id_ed25519
-for H in alveo-u50d-01 alveo-u50d-02 alveo-u55c-05 alveo-u55c-06; do
+for H in alveo-u50d-01 alveo-u50d-02 alveo-u55c-03 alveo-u55c-04; do
     ssh-copy-id tbertini@$H
 done
 
 # 3. Optional: add to PATH
-ln -s ~/Desktop/incast-bench/incast-bench ~/bin/incast-bench
+ln -s ~/Desktop/incast-bench/incast-bench.py ~/bin/incast-bench
 ```
 
 After step 2, all subsequent SSH connections (including the script) need no
@@ -32,12 +32,12 @@ password.
 # Smallest case: 1:1, 10s
 incast-bench -r alveo-u50d-02 -s alveo-u50d-01 -D 10
 
-# Original 3:1 incast from your Apr 1 experiment
+# 3:1 incast
 incast-bench -r alveo-u50d-02 \
-             -s alveo-u50d-01 alveo-u55c-05 alveo-u55c-06
+             -s alveo-u50d-01 alveo-u55c-03 alveo-u55c-04
 
 # Reproducibility check — 5 back-to-back runs with mean ± stddev
-incast-bench -r alveo-u50d-02 -s alveo-u50d-01 alveo-u55c-05 --runs 5
+incast-bench -r alveo-u50d-02 -s alveo-u50d-01 alveo-u55c-03 --runs 5
 
 # Tweak parameters
 incast-bench -r alveo-u50d-02 -s alveo-u50d-01 \
@@ -48,7 +48,15 @@ incast-bench -r alveo-u50d-02 -s alveo-u50d-01 --skip-baseline
 
 # Tag a run with a reason (appears in report + directory name)
 incast-bench -r alveo-u50d-02 -s alveo-u50d-01 \
-             -m "Baseline before Geert enables PFC on switch"
+             -m "Baseline before PFC enabled on switch"
+
+# Recovery test: u50d-01 runs the full 30s; u55c-03/04 stop after 10s,
+# letting you observe whether u50d-01's CC algorithm recovers to line rate
+# once the competing flows quit.
+incast-bench -r alveo-u50d-02 \
+             -s alveo-u50d-01 alveo-u55c-03 alveo-u55c-04 \
+             -D 30 --stagger-stop 20 --keep-running alveo-u50d-01 \
+             -m "TIMELY recovery test"
 
 # Force interleaved mode (no iTerm2 windows)
 incast-bench -r alveo-u50d-02 -s alveo-u50d-01 --mode interleaved
@@ -78,6 +86,12 @@ incast-bench --help
    (one per port, starting at `--base-port`), waits 2s for them to bind,
    then launches one `ib_write_bw` client per sender, each targeting a
    distinct port. Output from each is captured and parsed.
+
+   With `--stagger-stop SECONDS`, the sender named in `--keep-running`
+   (or the first `--senders` entry by default) runs for the full
+   `--duration`, while every other sender runs for `(duration - stagger-stop)`
+   seconds. Use this to test whether a congestion-control algorithm recovers
+   to line rate after competing flows finish.
 7. **Snapshot post** — Same as step 5; differences become the report.
 
 ## Output
@@ -93,9 +107,9 @@ runs/
 │   ├── report.md              ← rendered report (also printed to stdout)
 │   ├── alveo-u50d-02.log      ← raw log for receiver
 │   ├── alveo-u50d-01.log      ← raw log for sender 1
-│   ├── alveo-u55c-05.log
-│   └── alveo-u55c-06.log
-├── 2026-04-16T10-15-44--pfc-enabled-by-geert/
+│   ├── alveo-u55c-03.log
+│   └── alveo-u55c-04.log
+├── 2026-04-16T10-15-44--pfc-enabled-on-switch/
 └── 2026-04-16T10-20-00--pfc-enabled-3-senders/
 ```
 
@@ -121,13 +135,34 @@ Always shown (even if zero), so you can confirm pipelines are working:
 A separate "Other non-zero deltas" section captures everything else that
 changed during the run (collapsible per host in the rendered markdown).
 
+When `--stagger-stop` is in effect, the report header records which sender
+ran for the full duration and how much earlier the others stopped, so the
+throughput numbers are interpretable later.
+
+## Flag reference
+
+Most useful flags, beyond the standard `-r/-s/-D`:
+
+- `--stagger-stop SECONDS` — non-`--keep-running` senders stop SECONDS
+  earlier than the long-running one. Used for CC recovery experiments.
+- `--keep-running HOST` — pin which sender runs the full `--duration`.
+  Defaults to the first `-s` argument.
+- `--runs N` — repeat the same run N times back-to-back. Prints a
+  cross-run mean ± stddev table at the end.
+- `--skip-baseline` — skip the per-host baseline configuration. Saves ~30s
+  per run when you know nothing has changed.
+- `-m "reason"` — string slugified into the run directory name and included
+  as a blockquote at the top of `report.md`.
+- `--mode {auto,iterm2,interleaved}` — visibility mode. `auto` picks iTerm2
+  on macOS if available, else `interleaved`.
+
 ## Troubleshooting
 
 - **"Cannot SSH to ..."** — You haven't set up SSH keys yet. Re-run the
   `ssh-keygen` + `ssh-copy-id` sequence above.
-- **"rigi-bluefield not installed on this host"** — the U55c machines (or
-  any new host) don't have Geert's script. Either ask Geert to deploy it
-  there, or accept that baseline configuration is skipped on that host.
+- **"rigi-bluefield not installed on this host"** — `rigi-bluefield` isn't
+  deployed there. Baseline configuration is skipped on that host; the
+  benchmark still runs.
 - **"address already in use"** — A previous `ib_write_bw` server is still
   bound. SSH in and `pkill -f ib_write_bw`.
 - **iTerm2 windows don't open** — Make sure iTerm2 has Accessibility
@@ -135,8 +170,10 @@ changed during the run (collapsible per host in the rendered markdown).
   AppleScript can drive it.
 - **Inconsistent throughput** — Pass `--skip-baseline` and run twice in
   quick succession to confirm baseline drift isn't the issue. If still
-  inconsistent, the switch state is the variable (which is the whole
-  point of these reproducibility runs with Geert/Derk).
+  inconsistent, the switch state is the variable.
+- **`--stagger-stop` value too large** — the script aborts if
+  `(duration - stagger-stop) < 1` (otherwise the short-duration senders
+  would never run). Lower `--stagger-stop` or raise `-D`.
 
 ## Requirements
 
