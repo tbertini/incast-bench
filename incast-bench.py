@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-incast-bench.py — Many-sender → one-receiver RoCEv2 incast orchestrator.
+incast-bench — RDMA incast benchmark orchestrator (ETHZ Systems Group).
 
-Drives an `ib_write_bw` incast experiment across a set of Mellanox
-BlueField-3 / ConnectX hosts, snapshots NIC counters before and after, and
-produces a Markdown report. Single-file, stdlib-only; macOS- and
-Linux-friendly.
+Coordinates ib_write_bw runs across multiple senders → one receiver, via SSH
+ControlMaster (one connection per host). Captures per-host output into local
+log files; optionally opens iTerm2 windows tailing those logs for live
+visibility. Snapshots NIC counters before/after and produces a markdown
+report with deltas.
 
-Defaults assume a fleet using `mlx5_0` / `data1` and the `rigi-bluefield`
-QoS wrapper on BF3 hosts; both can be adjusted at the top of the file or
-via CLI flags. See README.md for setup and caveats.
+Requirements:
+  * Python 3.9+, stdlib only
+  * Passwordless SSH to all hosts (set up once via `ssh-copy-id`)
+  * `rigi-bluefield` and `perftest` installed on the remote hosts
+  * macOS with iTerm2 (optional — falls back to interleaved mode otherwise)
+
+Usage:
+  incast-bench -r alveo-u50d-02 -s alveo-u50d-01 alveo-u55c-05 alveo-u55c-06
 """
 
 from __future__ import annotations
@@ -18,1163 +24,858 @@ import argparse
 import os
 import re
 import shlex
-import statistics
+import shutil
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# -----------------------------------------------------------------------------
+# Constants & defaults
+# -----------------------------------------------------------------------------
 
-# =============================================================================
-# Constants
-# =============================================================================
+DEFAULT_USER = "tbertini"
+DEFAULT_DOMAIN = ""
+DEFAULT_DURATION = 30
+DEFAULT_MSG_SIZE = 65536
+DEFAULT_GID_INDEX = 3
+DEFAULT_BASE_PORT = 18515
+DEFAULT_DEVICE = "mlx5_0"
+DEFAULT_IFACE = "data1"
+DATA_SUFFIX = "-data1"  # senders connect to <receiver>-data1
 
-# Identify BlueField-3 hosts by hostname allowlist rather than by SSH-probing.
-# Probing would mean an extra round-trip per host on startup just to read
-# /sys/class/infiniband/mlx5_0/board_id or similar — a hardcoded list keeps
-# startup fast for stable fleets. Override at the CLI with --bluefield-hosts.
-DEFAULT_BLUEFIELD_HOSTS = ("alveo-u50d-01", "alveo-u50d-02")
+INCAST_ROOT = Path.home() / "Desktop" / "incast-bench"
+RUNS_DIR = INCAST_ROOT / "runs"
+SSH_CTRL_DIR = INCAST_ROOT / ".ssh-ctrl"
 
-DEFAULT_RDMA_DEV = "mlx5_0"
-DEFAULT_NET_IF = "data1"
+BF_MST_PATH = "/dev/mst/mt41692_pciconf0"
+IB_COUNTERS_DIR = "/sys/class/infiniband/mlx5_0/ports/1/counters"
+IB_HW_COUNTERS_DIR = "/sys/class/infiniband/mlx5_0/ports/1/hw_counters"
 
-# Counters worth a top-level table even when zero — these are the ones that
-# directly indicate whether DCQCN signals (CNPs, ECN marks) are flowing and
-# whether the network is dropping or pausing. Worth eyeballing every run
-# rather than relying on "no errors visible" to mean things are working.
-HEADLINE_COUNTERS = (
-    ("hw", "np_cnp_sent"),
-    ("hw", "rp_cnp_handled"),
-    ("hw", "np_ecn_marked_roce_packets"),
-    ("hw", "out_of_buffer"),
-    ("hw", "out_of_sequence"),
-    ("hw", "packet_seq_err"),
-    ("hw", "local_ack_timeout_err"),
-    ("hw", "implied_nak_seq_err"),
-    ("hw", "rnr_nak_retry_err"),
-    ("ethtool", "rx_ecn_mark"),
-    ("ethtool", "rx_discards_phy"),
-    ("ethtool", "rx_prio0_pause"),
-    ("ethtool", "rx_prio3_pause"),
-    ("ethtool", "tx_prio0_pause"),
-    ("ethtool", "tx_prio3_pause"),
-    ("ib", "port_rcv_errors"),
-    ("ib", "port_xmit_discards"),
-    ("ib", "port_xmit_data"),
-    ("ib", "port_rcv_data"),
-)
+# Counters always shown in the headline section of the report (even when 0)
+HEADLINE_HW = [
+    "np_cnp_sent",
+    "rp_cnp_handled",
+    "np_ecn_marked_roce_packets",
+    "out_of_buffer",
+    "out_of_sequence",
+    "packet_seq_err",
+    "local_ack_timeout_err",
+    "implied_nak_seq_err",
+    "rnr_nak_retry_err",
+]
+HEADLINE_ETHTOOL = [
+    "rx_ecn_mark",
+    "rx_discards_phy",
+    "rx_prio0_pause", "rx_prio3_pause",
+    "tx_prio0_pause", "tx_prio3_pause",
+]
+HEADLINE_IB = [
+    "port_rcv_errors", "port_xmit_discards",
+    "port_xmit_data", "port_rcv_data",
+]
 
-SSH_CONNECT_TIMEOUT = 10
-RECEIVER_BIND_DELAY = 4    # 2s is too tight under load; 4s is a safe floor
-HANDSHAKE_PAD = 30         # extra slack on top of -D for QP setup + teardown
-
-# rigi-bluefield baseline. `set tc-mapping` and `set buffer` are intentionally
-# omitted: they require a newer `mlnx_qos` than is installed on many fleets
-# (depends on the `--tc_tsa` flag), and the default prio→TC mapping is
-# typically already correct so they were no-ops anyway. Add them here if your
-# fleet needs them.
-RIGI_BASELINE_CMDS = (
-    "sudo rigi-bluefield set pfc-prio3",
-    "sudo rigi-bluefield set trust-dscp",
-    "sudo rigi-bluefield set ecn-np --all",
-    "sudo rigi-bluefield set ecn-rp --all",
-)
-# PCC init runs only if `doca_pcc` is actually running on the host (auto-
-# detected via pgrep — see phase_baseline). Without the daemon, both
-# `set pcc` and `pcc-query` error with "Bad Device" / "No such file"
-# because pcc_counters.sh reads a diag-counter region that the daemon
-# registers with the firmware at startup. We track per-host whether init
-# succeeded so subsequent `pcc-query` calls only run on hosts that have
-# both the daemon AND a working init.
-RIGI_PCC_INIT = "sudo rigi-bluefield set pcc"
-RIGI_PCC_QUERY = "sudo rigi-bluefield pcc-query"
+ANSI_COLORS = ["\033[36m", "\033[32m", "\033[33m", "\033[35m", "\033[34m", "\033[31m"]
+ANSI_RESET = "\033[0m"
 
 
-# =============================================================================
-# Output helpers
-# =============================================================================
-
-USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-
-
-def _c(text, code):
-    return f"\x1b[{code}m{text}\x1b[0m" if USE_COLOR else str(text)
-
-
-def red(t):    return _c(t, "31")
-def green(t):  return _c(t, "32")
-def yellow(t): return _c(t, "33")
-def cyan(t):   return _c(t, "36")
-def bold(t):   return _c(t, "1")
-def dim(t):    return _c(t, "2")
-
-
-def status_ok(name, msg, width):
-    print(f"  {name:<{width}}  {green('✓')} {msg}")
-
-
-def status_warn(name, msg, width):
-    print(f"  {name:<{width}}  {yellow('!')} {msg}")
-
-
-def status_fail(name, msg, width):
-    print(f"  {name:<{width}}  {red('✗')} {msg}")
-
-
-def print_phase(num, total, title):
-    print(f"\n{bold(f'[{num}/{total}]')} {title}")
-
-
-# =============================================================================
-# SSH plumbing
-# =============================================================================
-
-def _ssh_ctrl_dir() -> Path:
-    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    p = Path(cache) / "incast-bench" / "ssh-ctrl"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _strip_motd(text: str) -> str:
-    """OpenSSH writes the remote MOTD to stderr alongside any real error.
-    On auth failure the genuine reason gets buried under several hundred
-    lines of welcome banner; show only lines that look like diagnostics."""
-    keep = re.compile(
-        r"(Permission|denied|host key|Could not|refused|@[\w.-]+|"
-        r"port \d+:|not known|closed by remote|Bad config|"
-        r"Authentication|fatal|kex_exchange|Connection)",
-        re.I,
-    )
-    lines = [ln for ln in text.splitlines() if keep.search(ln)]
-    return "\n".join(lines).strip() or text.strip()
-
-
-class SSHError(Exception):
-    def __init__(self, host, msg):
-        self.host = host
-        self.msg = msg
-        super().__init__(f"{host}: {msg}")
-
-
-@dataclass
-class SSHTarget:
-    host: str
-    user: str
-    ctrl_path: Path
-
-    def _base(self, tty=False):
-        args = [
-            "ssh",
-            "-o", f"ControlPath={self.ctrl_path}",
-            "-o", "BatchMode=yes",
-            "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-        ]
-        if tty:
-            # -tt forces TTY allocation even when our local stdin isn't a TTY
-            # (which it won't be — we're running in a script). Required for
-            # `sudo` on hosts where sudoers has `Defaults requiretty` set;
-            # without -tt sudo fails with "sorry, you must have a tty to run
-            # sudo" and the rigi-bluefield baseline never applies.
-            args.append("-tt")
-        args.append(f"{self.user}@{self.host}")
-        return args
-
-    def open_master(self):
-        # ControlMaster lets every subsequent ssh invocation multiplex over
-        # one TCP+auth handshake. ControlPersist=60s keeps the master alive
-        # after the backgrounded process exits — without this we'd open
-        # 20+ connections per run and hosts would (rightly) start
-        # rate-limiting auth attempts.
-        cmd = [
-            "ssh",
-            "-o", f"ControlPath={self.ctrl_path}",
-            "-o", "ControlMaster=yes",
-            "-o", "ControlPersist=60",
-            "-o", "BatchMode=yes",
-            "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-            "-N", "-f",
-            f"{self.user}@{self.host}",
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise SSHError(self.host, _strip_motd(r.stderr))
-        # Verify the master actually works. BatchMode=yes + missing
-        # ssh-agent key often manifests here, not in -N -f.
-        v = subprocess.run(self._base() + ["true"], capture_output=True, text=True)
-        if v.returncode != 0:
-            raise SSHError(self.host, _strip_motd(v.stderr))
-
-    def close_master(self):
-        cmd = [
-            "ssh",
-            "-o", f"ControlPath={self.ctrl_path}",
-            "-O", "exit",
-            f"{self.user}@{self.host}",
-        ]
-        subprocess.run(cmd, capture_output=True, text=True)
-
-    def run(self, cmd: str, timeout: float = 30, tty: bool = False):
-        result = subprocess.run(
-            self._base(tty=tty) + [cmd],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        # With -tt, the remote PTY echoes \r\n instead of \n and may also
-        # inject standalone \r. Normalize so downstream parsers (which
-        # are line-anchored regexes) don't trip.
-        if tty:
-            result.stdout = result.stdout.replace("\r\n", "\n").replace("\r", "")
-            result.stderr = result.stderr.replace("\r\n", "\n").replace("\r", "")
-        return result
-
-    def popen(self, cmd: str) -> subprocess.Popen:
-        return subprocess.Popen(
-            self._base() + [cmd],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-
-
-# =============================================================================
-# Host model
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Data classes
+# -----------------------------------------------------------------------------
 
 @dataclass
 class Host:
-    name: str
+    name: str            # "alveo-u50d-01"
+    role: str            # "receiver" or "sender"
     user: str
-    is_bluefield: bool
-    role: str   # "receiver" | "sender"
-    ssh: Optional[SSHTarget] = None
-    log_path: Optional[Path] = None
-    pcc_available: bool = False
-    pre_counters: dict = field(default_factory=dict)
-    post_counters: dict = field(default_factory=dict)
-    pre_pcc_raw: str = ""
-    post_pcc_raw: str = ""
-    perftest_results: list = field(default_factory=list)
+    domain: str
+    log_path: Path
+    ctrl_path: Path
+    is_bluefield: bool = False
+    has_rigi: bool = False
+    color: str = ""
 
-    def log_append(self, text: str):
-        with open(self.log_path, "a") as f:
+    @property
+    def fqdn(self) -> str:
+        return f"{self.name}.{self.domain}" if self.domain else self.name
+
+    @property
+    def short(self) -> str:
+        return self.name.replace("alveo-", "")
+
+    def ssh_base(self) -> list[str]:
+        return [
+            "ssh",
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={self.ctrl_path}",
+            "-o", "ControlPersist=300s",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            f"{self.user}@{self.fqdn}",
+        ]
+
+
+@dataclass
+class CmdResult:
+    rc: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.rc == 0
+
+
+@dataclass
+class PerftestResult:
+    host: str
+    role: str
+    port: int
+    bw_avg_gbps: Optional[float] = None
+    bw_peak_gbps: Optional[float] = None
+    msg_rate_mpps: Optional[float] = None
+    raw_output: str = ""
+    error: Optional[str] = None
+
+
+# -----------------------------------------------------------------------------
+# Logging helpers
+# -----------------------------------------------------------------------------
+
+_log_lock = threading.Lock()
+
+
+def host_log(host: Host, text: str) -> None:
+    """Append text to the host's log file (thread-safe, line-buffered)."""
+    if not text:
+        return
+    if not text.endswith("\n"):
+        text += "\n"
+    host.log_path.parent.mkdir(parents=True, exist_ok=True)
+    with _log_lock:
+        with host.log_path.open("a") as f:
             f.write(text)
-            if not text.endswith("\n"):
-                f.write("\n")
-
-    def log_section(self, title: str):
-        self.log_append(
-            f"\n========== {title} @ {datetime.now().isoformat(timespec='seconds')} =========="
-        )
+            f.flush()
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
+# SSH helpers
+# -----------------------------------------------------------------------------
+
+def ssh_run(host: Host, cmd: str, *, timeout: int = 120, tee_log: bool = True,
+            log_header: Optional[str] = None, force_tty: bool = False) -> CmdResult:
+    """Run `cmd` on `host` via the existing ControlMaster connection."""
+    if log_header and tee_log:
+        host_log(host, f"\n$ {log_header}")
+    full = host.ssh_base() + (["-tt"] if force_tty else []) + [cmd]
+    try:
+        p = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        msg = f"[TIMEOUT after {timeout}s] {cmd}"
+        if tee_log:
+            host_log(host, msg)
+        return CmdResult(rc=124, stdout=e.stdout or "", stderr=msg)
+    # With -tt, stderr merges into stdout; clean up PTY artifacts
+    stdout = p.stdout
+    stderr = p.stderr
+    if force_tty:
+        stdout = stdout.replace("\r\n", "\n").replace("\r", "")
+    if tee_log:
+        if stdout:
+            host_log(host, stdout)
+        if stderr:
+            host_log(host, "[stderr] " + stderr.replace("\n", "\n[stderr] "))
+    return CmdResult(rc=p.returncode, stdout=stdout, stderr=stderr)
+
+
+def open_master(host: Host) -> None:
+    """Establish the ControlMaster connection. Errors out clearly on auth failure."""
+    host.ctrl_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = host.ssh_base() + ["true"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(_ssh_help_message(host, "connection timed out"))
+    if p.returncode != 0:
+        raise RuntimeError(_ssh_help_message(host, p.stderr.strip() or "unknown failure"))
+
+
+def close_master(host: Host) -> None:
+    cmd = ["ssh", "-o", f"ControlPath={host.ctrl_path}", "-O", "exit",
+           f"{host.user}@{host.fqdn}"]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+
+def _ssh_help_message(host: Host, detail: str) -> str:
+    return (
+        f"\n❌ Cannot SSH to {host.fqdn}.\n"
+        f"   Reason: {detail}\n\n"
+        f"   This script REQUIRES passwordless SSH (key-based auth).\n"
+        f"   Set it up once with:\n\n"
+        f"     ssh-keygen -t ed25519           # only if you don't have a key\n"
+        f"     ssh-copy-id {host.user}@{host.fqdn}\n\n"
+        f"   Then re-run this script.\n"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Detection
+# -----------------------------------------------------------------------------
+
+def detect_capabilities(host: Host) -> tuple[bool, bool]:
+    """Return (is_bluefield, has_rigi_bluefield)."""
+    cmd = (
+        "if [ -d /opt/mellanox/doca ]; then echo BF=yes; else echo BF=no; fi; "
+        "if command -v rigi-bluefield >/dev/null 2>&1; then echo RIGI=yes; else echo RIGI=no; fi"
+    )
+    r = ssh_run(host, cmd, tee_log=True, log_header="detect capabilities", timeout=15)
+    is_bf = "BF=yes" in r.stdout
+    has_rigi = "RIGI=yes" in r.stdout
+    return is_bf, has_rigi
+
+
+# -----------------------------------------------------------------------------
+# Baseline configuration
+# -----------------------------------------------------------------------------
+
+def apply_baseline(host: Host) -> bool:
+    """Apply baseline config to a host. Tolerant of individual step failures."""
+    steps: list[tuple[str, str, bool]] = []  # (label, cmd, requires_rigi)
+
+    if host.name == "alveo-u50d-02":
+        # Workaround for known data2 bug on this machine specifically
+        steps.append(("datanic-down-data2", "sudo datanic down data2 || true", False))
+
+    steps += [
+        ("mtu-4200",   f"sudo rigi-bluefield sysfs write /sys/class/net/{DEFAULT_IFACE}/mtu 4200", True),
+        ("trust-dscp", "sudo rigi-bluefield set trust-dscp",                                       True),
+        ("pfc-prio3",  "sudo rigi-bluefield set pfc-prio3",                                        True),
+        ("ecn-np-3",   "sudo rigi-bluefield set ecn-np 3",                                         True),
+        ("ecn-rp-3",   "sudo rigi-bluefield set ecn-rp 3",                                         True),
+        ("tc-mapping", "sudo rigi-bluefield set tc-mapping",                                       True),
+        ("buffer",     "sudo rigi-bluefield set buffer",                                           True),
+    ]
+    if host.is_bluefield:
+        steps.append(("pcc-init", "sudo rigi-bluefield set pcc", True))
+
+    all_ok = True
+    skipped_rigi = False
+    for label, cmd, needs_rigi in steps:
+        if needs_rigi and not host.has_rigi:
+            skipped_rigi = True
+            continue
+        r = ssh_run(host, cmd, tee_log=True, log_header=f"baseline:{label}",
+                    timeout=30, force_tty=True)
+        if not r.ok:
+            host_log(host, f"  ⚠️  baseline step '{label}' failed (rc={r.rc})")
+            all_ok = False
+    if skipped_rigi:
+        host_log(host, "  ⚠️  rigi-bluefield not installed on this host — baseline steps that "
+                       "depend on it were skipped.")
+    return all_ok
+
+
+# -----------------------------------------------------------------------------
 # Counter snapshots
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-# All three counter sources in one SSH round-trip per host. Mellanox HW
-# counters are read-only monotonic registers — we snapshot before and after
-# and subtract. Don't try to reset (would need a driver reload).
-COUNTER_SCRIPT = (
-    r"""
+SNAPSHOT_SCRIPT = f"""
 echo '===ETHTOOL==='
-ethtool -S """ + DEFAULT_NET_IF + r""" 2>&1 || true
-echo '===IB==='
-for f in /sys/class/infiniband/""" + DEFAULT_RDMA_DEV + r"""/ports/1/counters/*; do
-    [ -f "$f" ] && printf '%s:%s\n' "$(basename $f)" "$(cat $f 2>/dev/null)"
+ethtool -S {DEFAULT_IFACE} 2>/dev/null
+echo '===IB_COUNTERS==='
+for f in {IB_COUNTERS_DIR}/*; do
+  [ -f "$f" ] && echo "$(basename $f): $(cat $f 2>/dev/null)"
 done
-echo '===HW==='
-for f in /sys/class/infiniband/""" + DEFAULT_RDMA_DEV + r"""/ports/1/hw_counters/*; do
-    [ -f "$f" ] && printf '%s:%s\n' "$(basename $f)" "$(cat $f 2>/dev/null)"
+echo '===IB_HW_COUNTERS==='
+for f in {IB_HW_COUNTERS_DIR}/*; do
+  [ -f "$f" ] && echo "$(basename $f): $(cat $f 2>/dev/null)"
 done
 """
-)
-
-_ETHTOOL_RE = re.compile(r"^\s*([\w]+):\s*(-?\d+)\s*$")
-_SYSFS_RE = re.compile(r"^([\w]+):(-?\d+)\s*$")
-_PCC_RE = re.compile(r"^\s*([\w_.-]+)\s*[:=]\s*(-?\d+)\s*$")
 
 
-def _parse_counter_output(text):
-    counters = {}
-    section = None
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        if line.startswith("==="):
-            section = line.strip("= ").strip()
-            continue
-        if section == "ETHTOOL":
-            m = _ETHTOOL_RE.match(line)
-            if m:
-                counters[("ethtool", m.group(1))] = int(m.group(2))
-        elif section in ("IB", "HW"):
-            m = _SYSFS_RE.match(line)
-            if m:
-                cls = "ib" if section == "IB" else "hw"
-                counters[(cls, m.group(1))] = int(m.group(2))
-        elif section == "PCC":
-            m = _PCC_RE.match(line)
-            if m:
-                counters[("pcc", m.group(1))] = int(m.group(2))
+def snapshot_counters(host: Host, label: str) -> dict[str, int]:
+    # Non-sudo counters (ethtool + IB)
+    r = ssh_run(host, SNAPSHOT_SCRIPT, tee_log=True, log_header=f"snapshot:{label}", timeout=30)
+    if not r.ok:
+        return {}
+    counters = parse_counters(r.stdout)
+    # PCC counters require sudo → force TTY
+    if host.is_bluefield and host.has_rigi:
+        pcc_cmd = "echo '===PCC_QUERY==='; sudo rigi-bluefield pcc-query 2>/dev/null"
+        r2 = ssh_run(host, pcc_cmd, tee_log=True, log_header=f"snapshot:{label}:pcc",
+                     timeout=30, force_tty=True)
+        if r2.ok:
+            counters.update(parse_counters(r2.stdout))
     return counters
 
 
-def _extract_section(raw: str, wanted: str) -> str:
-    out, in_section = [], False
-    for line in raw.splitlines():
-        if line.startswith("==="):
-            in_section = wanted in line
+_PCC_LINE_RE = re.compile(r"Counter:\s*(\S+)\s+Value:\s*([0-9a-fA-F]+)")
+
+
+def parse_counters(text: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("===") and line.endswith("==="):
+            section = line.strip("= ")
             continue
-        if in_section:
-            out.append(line)
-    return "\n".join(out)
-
-
-def snapshot_host(host: Host):
-    cmd = COUNTER_SCRIPT
-    use_tty = False
-    if host.is_bluefield and host.pcc_available:
-        cmd += f"\necho '===PCC==='\n{RIGI_PCC_QUERY} 2>&1 || true\n"
-        # pcc-query is invoked via sudo and the fleet's sudoers has
-        # `Defaults requiretty`; without -tt the whole script gets
-        # rejected with "sorry, you must have a tty to run sudo".
-        use_tty = True
-    res = host.ssh.run(cmd, timeout=45, tty=use_tty)
-    return _parse_counter_output(res.stdout), res.stdout
-
-
-def diff_counters(pre: dict, post: dict) -> dict:
-    out = {}
-    for k in set(pre) | set(post):
-        delta = post.get(k, 0) - pre.get(k, 0)
-        if delta != 0:
-            out[k] = delta
+        if not line:
+            continue
+        if section == "PCC_QUERY":
+            m = _PCC_LINE_RE.search(line)
+            if m:
+                # pcc-query output is zero-padded 16-digit hex
+                try:
+                    out["pcc__" + m.group(1)] = int(m.group(2), 16)
+                except ValueError:
+                    pass
+            continue
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if not key or not val:
+            continue
+        try:
+            n = int(val)
+        except ValueError:
+            continue
+        prefix = {
+            "ETHTOOL": "ethtool__",
+            "IB_COUNTERS": "ib__",
+            "IB_HW_COUNTERS": "hw__",
+        }.get(section, "")
+        if prefix:
+            out[prefix + key] = n
     return out
 
 
-# =============================================================================
-# perftest
-# =============================================================================
-
-def perftest_cmd(port, msg_size, duration, gid_idx, tos, target=None):
-    """Build an `ib_write_bw` invocation.
-
-    The non-obvious bits (the traffic-priority trap):
-      -R         use rdma_cm for QP setup (required for --tos to apply)
-      --tos 105  = (DSCP 26 << 2) | 0b01 = ECT(1).  DSCP 26 maps to prio 3
-                  via DSCP-trust on the BF3 hosts; ECT(1) makes packets
-                  ECN-capable so the switch can MARK on congestion instead
-                  of dropping. --tos 104 looks right but its low 2 bits are
-                  Not-ECT and the switch will drop, not mark.
-    """
-    parts = [
-        "ib_write_bw",
-        "-d", DEFAULT_RDMA_DEV,
-        "-p", str(port),
-        "-x", str(gid_idx),
-        "-F",                  # don't complain about CPU frequency scaling
-        "-R",                  # rdma_cm
-        "--tos", str(tos),
-        "--report_gbits",
-        "-D", str(duration),
-        "-s", str(msg_size),
-    ]
-    if target is not None:
-        parts.append(target)
-    return " ".join(shlex.quote(p) for p in parts)
+def diff_counters(pre: dict[str, int], post: dict[str, int]) -> dict[str, int]:
+    deltas: dict[str, int] = {}
+    keys = set(pre) | set(post)
+    for k in keys:
+        d = post.get(k, 0) - pre.get(k, 0)
+        if d != 0:
+            deltas[k] = d
+    return deltas
 
 
-_BW_HEADER_RE = re.compile(r"BW peak.*BW average.*MsgRate", re.I)
+# -----------------------------------------------------------------------------
+# Benchmark execution
+# -----------------------------------------------------------------------------
+
+# Standard ib_write_bw output line:
+#  #bytes  #iterations  BW peak[Gb/sec]  BW average[Gb/sec]  MsgRate[Mpps]
+#  65536   150000        92.50              92.39                 0.18
+_PERFTEST_LINE_RE = re.compile(
+    r"^\s*\d+\s+\d+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$"
+)
 
 
-def parse_perftest(text: str):
-    """Pull the summary line out of `ib_write_bw` output.
-
-    Format:
-        #bytes  #iterations   BW peak[Gb/sec]  BW average[Gb/sec]  MsgRate[Mpps]
-    The data line is the next non-separator non-empty line after the header.
-    """
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if _BW_HEADER_RE.search(line):
-            for j in range(i + 1, len(lines)):
-                cand = lines[j].strip()
-                if not cand or set(cand) <= set("- "):
-                    continue
-                f = cand.split()
-                if len(f) >= 5:
-                    try:
-                        return {
-                            "bytes": int(f[0]),
-                            "bw_peak": float(f[2]),
-                            "bw_avg": float(f[3]),
-                            "mpps": float(f[4]),
-                        }
-                    except ValueError:
-                        return None
-                return None
-    return None
+def parse_perftest(text: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return (bw_peak, bw_avg, msg_rate)."""
+    for line in text.splitlines():
+        m = _PERFTEST_LINE_RE.match(line)
+        if m:
+            return float(m.group(1)), float(m.group(2)), float(m.group(3))
+    return None, None, None
 
 
-def spawn_perftest(host: Host, role: str, port: int, args, target=None):
-    cmd = perftest_cmd(port, args.msg_size, args.duration, args.gid_index, args.tos, target)
-    proc = host.ssh.popen(cmd)
-    out_buf: list = []
-    prefix = f"[{role} :{port}] "
-    log_path = host.log_path
-
-    def reader():
-        with open(log_path, "a") as f:
-            f.write(
-                f"\n========== ib_write_bw {role} :{port} @ "
-                f"{datetime.now().isoformat(timespec='seconds')} ==========\n"
-            )
-            f.write(f"$ {cmd}\n")
-            for line in proc.stdout:
-                out_buf.append(line)
-                f.write(prefix + line)
-                f.flush()
-
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
-    return {"proc": proc, "thread": t, "out": out_buf, "port": port,
-            "role": role, "host": host, "cmd": cmd}
+def _run_receiver_port(host: Host, port: int, args) -> PerftestResult:
+    """Run a single ib_write_bw server instance on one port."""
+    bw_cmd = (f"ib_write_bw -d {DEFAULT_DEVICE} -x {args.gid_index} -F --report_gbits "
+              f"-D {args.duration} -s {args.msg_size} -p {port}")
+    r = ssh_run(host, bw_cmd, tee_log=True,
+                log_header=f"receiver port {port}",
+                timeout=args.duration + 60)
+    peak, avg, mpps = parse_perftest(r.stdout)
+    return PerftestResult(
+        host=host.name, role="receiver", port=port,
+        bw_avg_gbps=avg, bw_peak_gbps=peak, msg_rate_mpps=mpps,
+        raw_output=r.stdout,
+        error=None if r.ok else (r.stderr.strip() or f"rc={r.rc}"),
+    )
 
 
-# =============================================================================
-# iTerm2 visibility
-# =============================================================================
+def run_receiver(host: Host, ports: list[int], args) -> dict[int, PerftestResult]:
+    """Spawn N ib_write_bw servers in parallel (one SSH call per port)."""
+    with ThreadPoolExecutor(max_workers=len(ports)) as ex:
+        futures = {port: ex.submit(_run_receiver_port, host, port, args) for port in ports}
+        return {port: fut.result() for port, fut in futures.items()}
 
-def has_iterm2() -> bool:
-    if sys.platform != "darwin":
+
+def run_sender(host: Host, port: int, receiver_addr: str, args) -> PerftestResult:
+    bw_cmd = (f"ib_write_bw -d {DEFAULT_DEVICE} -x {args.gid_index} -F --report_gbits "
+              f"-D {args.duration} -s {args.msg_size} -p {port} {receiver_addr}")
+    r = ssh_run(host, bw_cmd, tee_log=True,
+                log_header=f"sender → {receiver_addr}:{port}",
+                timeout=args.duration + 60)
+    peak, avg, mpps = parse_perftest(r.stdout)
+    return PerftestResult(
+        host=host.name, role="sender", port=port,
+        bw_avg_gbps=avg, bw_peak_gbps=peak, msg_rate_mpps=mpps,
+        raw_output=r.stdout,
+        error=None if r.ok else (r.stderr.strip() or f"rc={r.rc}"),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Visibility: iTerm2 windows OR interleaved fallback
+# -----------------------------------------------------------------------------
+
+def open_iterm2_windows(hosts: list[Host]) -> bool:
+    """One iTerm2 window per host, each tailing its local log file."""
+    if not shutil.which("osascript"):
         return False
-    return os.path.exists("/Applications/iTerm.app") or os.path.exists(
-        os.path.expanduser("~/Applications/iTerm.app")
-    )
-
-
-def open_iterm2_window(log_path: Path, title: str):
-    # Setting the iTerm window title is finicky because the displayed
-    # title depends on the profile's "Title" setting. Setting `name` via
-    # AppleScript only shows up when the profile includes "Session Name"
-    # in its title format — for default profiles that show "Job Name"
-    # (which is what was making every window read "tail -F"), we need
-    # to also send OSC escape sequences from inside the shell:
-    #   ESC]0;NAME BEL  → icon + window title (the standard one)
-    #   ESC]1;NAME BEL  → icon name (which iTerm uses as tab title)
-    #   ESC]2;NAME BEL  → window title (xterm-style)
-    # All three are sent up front via printf, then tail runs. Belt-and-
-    # suspenders: at least one of these will display depending on the
-    # user's profile config.
-    title_safe = title.replace("'", "'\\''")  # escape ' for single-quoted shell
-    title_escapes = (
-        r"\033]0;" + title_safe + r"\007"
-        + r"\033]1;" + title_safe + r"\007"
-        + r"\033]2;" + title_safe + r"\007"
-    )
-    shell_cmd = (
-        f"printf '{title_escapes}'; "
-        + "tail -F " + shlex.quote(str(log_path))
-    )
-    # AppleScript string-literal escapes: \ → \\, " → \"
-    cmd_escaped = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
-    title_escaped = title.replace("\\", "\\\\").replace('"', '\\"')
-    # Capture the new window in a variable rather than relying on `current
-    # window` (which races when multiple windows are created in quick
-    # succession). Run `write text` BEFORE `set name` so the window is
-    # populated even if name-setting fails on a future iTerm version.
-    script = (
-        'tell application "iTerm"\n'
-        '    activate\n'
-        '    set w to (create window with default profile)\n'
-        '    tell current session of w\n'
-        f'        write text "{cmd_escaped}"\n'
-        f'        set name to "{title_escaped}"\n'
-        '    end tell\n'
-        'end tell\n'
-    )
-    r = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True, text=True, timeout=10,
-    )
-    if r.returncode != 0:
-        # Surface the error rather than silently leaving an empty window.
-        sys.stderr.write(
-            f"  {yellow('!')} osascript failed for {title}: "
-            f"{(r.stderr or 'unknown').strip()}\n"
-        )
-
-
-# =============================================================================
-# Phases
-# =============================================================================
-
-def phase_open_ssh(hosts):
-    width = max(len(h.name) for h in hosts)
-    errors = []
-
-    def go(h):
-        try:
-            h.ssh.open_master()
-            return h, None
-        except SSHError as e:
-            return h, e
-
-    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-        for fut in as_completed([ex.submit(go, h) for h in hosts]):
-            h, err = fut.result()
-            if err is None:
-                status_ok(h.name, "connected", width)
-            else:
-                first_line = err.msg.split("\n")[0][:120] if err.msg else "unknown error"
-                status_fail(h.name, first_line, width)
-                errors.append(err)
-
-    if errors:
-        # Lesson #2: if every host fails with "Permission denied", the
-        # ssh-agent is almost certainly the culprit (laptop slept, agent
-        # died, key timed out). Surface this as the very first thing to
-        # try.
-        msg = ["Could not establish SSH to all hosts."]
-        if all(re.search(r"denied|permission", e.msg, re.I) for e in errors):
-            msg.append(
-                "All failures look like 'Permission denied'. Check your "
-                "ssh-agent first:\n"
-                "  $ ssh-add -l        # should list a key\n"
-                "  $ ssh-add ~/.ssh/id_ed25519   # if empty"
-            )
-        raise RuntimeError("\n".join(msg))
-
-
-def phase_pkill_stale(hosts, label):
-    """Kill any orphaned ib_write_bw from a previous crashed run.
-
-    Lesson #1: receiver perftests outlive their parent SSH session if the
-    previous run was Ctrl+C'd, lost SSH, or hit a timeout — the next run
-    then hits EADDRINUSE on port 18515. Pkill on every host before AND
-    after every run (the after part lives in `finally`, BEFORE
-    ControlMaster teardown — otherwise pkill never reaches the host).
-    """
-    width = max(len(h.name) for h in hosts)
-
-    def go(h):
-        # `pkill -u $USER` returns 1 when no processes match — fine.
-        # The double-pkill (TERM, then KILL after a brief grace) is so we
-        # don't leave anything zombied if a perftest was wedged.
-        h.ssh.run(
-            "pkill -u $USER ib_write_bw; sleep 0.3; "
-            "pkill -9 -u $USER ib_write_bw; true",
-            timeout=15,
-        )
-        return h
-
-    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-        for fut in as_completed([ex.submit(go, h) for h in hosts]):
-            h = fut.result()
-            status_ok(h.name, label, width)
-
-
-def phase_visibility(hosts, mode_arg):
-    if mode_arg == "iterm2" and not has_iterm2():
-        print(f"  {yellow('!')} iTerm2 requested but not installed; falling back to interleaved")
-        return "interleaved"
-    if mode_arg == "auto":
-        mode = "iterm2" if has_iterm2() else "interleaved"
-    else:
-        mode = mode_arg
-
-    if mode == "iterm2":
-        for h in hosts:
-            open_iterm2_window(h.log_path, h.name)
-            # Stagger so iTerm doesn't drop one of them under contention.
-            # 0.15s was too tight on a busy laptop and would occasionally
-            # cause windows to merge or the AppleScript to fail silently.
-            time.sleep(0.3)
-        print(f"  {green('✓')} {len(hosts)} iTerm2 window(s) opened")
-    else:
-        print(f"  {dim('(interleaved mode — host output streams below the run line)')}")
-    return mode
-
-
-def _trim(s: str, n: int = 200) -> str:
-    s = s.strip()
-    return s[:n] + "…" if len(s) > n else s
-
-
-def phase_baseline(hosts, failed):
-    width = max(len(h.name) for h in hosts)
-
-    def go(h):
-        if not h.is_bluefield:
-            return h, "skipped (ConnectX)", []
-        h.log_section("BASELINE")
-        host_failures = []
-
-        # Preflight: ensure Mellanox Software Tools is running. `mst start`
-        # loads the kernel module and creates /dev/mst/mt41692_pciconf0,
-        # which rigi-bluefield's pcc_counters.sh and mlxreg-based commands
-        # need. Typically persists across reboots once started, so this is
-        # a no-op on subsequent runs.
-        mst_check = h.ssh.run("ls /dev/mst/mt*_pciconf0 2>/dev/null", timeout=10)
-        if mst_check.returncode != 0 or not mst_check.stdout.strip():
-            r = h.ssh.run("sudo mst start", timeout=20, tty=True)
-            h.log_append(f"$ sudo mst start\n{r.stdout}{r.stderr}\nrc={r.returncode}")
-            if r.returncode != 0:
-                # If mst isn't installed at all, surface that clearly —
-                # everything else on this host will fail without it.
-                host_failures.append(("sudo mst start", _trim(r.stderr or r.stdout)))
-                return h, f"{red('mst start failed')} (skipping baseline)", host_failures
-
-        for cmd in RIGI_BASELINE_CMDS:
-            # tty=True: every rigi-bluefield call goes through sudo, and
-            # our hosts have `Defaults requiretty` in sudoers. Without -tt
-            # every command fails with "sorry, you must have a tty to run
-            # sudo" before it does anything.
-            r = h.ssh.run(cmd, timeout=30, tty=True)
-            h.log_append(f"$ {cmd}\n{r.stdout}{r.stderr}\nrc={r.returncode}")
-            if r.returncode != 0:
-                host_failures.append((cmd, _trim(r.stderr or r.stdout)))
-
-        # PCC ops only make sense when a `doca_pcc` daemon is actually
-        # running on this host. pcc_counters.sh reads/writes a diag-counter
-        # region that the daemon registers with the firmware at startup —
-        # without the daemon, both `set pcc` and `pcc-query` error with
-        # "Bad Device" / "No such file" and pollute the failed-commands
-        # table on every run. Detect via `pgrep` and skip cleanly when
-        # absent (typical on the receiver host, or any baseline run
-        # without a PCC algorithm loaded).
-        pcc_probe = h.ssh.run("pgrep -x doca_pcc", timeout=10)
-        if pcc_probe.returncode != 0:
-            h.log_append(
-                "$ pgrep -x doca_pcc\n"
-                "(no daemon running on this host — skipping PCC init/query)"
-            )
-            return h, "configured (no PCC daemon)", host_failures
-
-        # Daemon present — try to wire up the diag counters. If this fails
-        # despite the daemon running, the firmware is in a bad state
-        # (e.g. stale registration from a previous session); we surface
-        # that as a real failure since PCC was expected to work.
-        r = h.ssh.run(RIGI_PCC_INIT, timeout=30, tty=True)
-        h.log_append(f"$ {RIGI_PCC_INIT}\n{r.stdout}{r.stderr}\nrc={r.returncode}")
-        if r.returncode == 0:
-            h.pcc_available = True
-            return h, "configured + pcc ok", host_failures
-        else:
-            host_failures.append((RIGI_PCC_INIT, _trim(r.stderr or r.stdout)))
-            return h, f"configured ({yellow('pcc init failed')})", host_failures
-
-    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-        for fut in as_completed([ex.submit(go, h) for h in hosts]):
-            h, msg, hf = fut.result()
-            for cmd, err in hf:
-                failed.append((h.name, cmd, err))
-            if "skipped" in msg:
-                print(f"  {h.name:<{width}}  {dim('—')} {msg}")
-            else:
-                status_ok(h.name, msg, width)
-
-
-def phase_snapshot(hosts, when, failed):
-    width = max(len(h.name) for h in hosts)
-
-    def go(h):
-        h.log_section(f"SNAPSHOT {when.upper()}")
-        try:
-            counters, raw = snapshot_host(h)
-            h.log_append(raw)
-            return h, counters, raw, None
-        except subprocess.TimeoutExpired as e:
-            return h, {}, "", str(e)
-        except Exception as e:
-            return h, {}, "", f"{type(e).__name__}: {e}"
-
-    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-        for fut in as_completed([ex.submit(go, h) for h in hosts]):
-            h, counters, raw, err = fut.result()
-            if err:
-                failed.append((h.name, f"snapshot ({when})", err))
-                status_fail(h.name, f"snapshot failed: {err}", width)
-                continue
-            if when == "pre":
-                h.pre_counters = counters
-                h.pre_pcc_raw = _extract_section(raw, "PCC")
-            else:
-                h.post_counters = counters
-                h.post_pcc_raw = _extract_section(raw, "PCC")
-            status_ok(h.name, f"{len(counters)} counters", width)
-
-
-def phase_run(receiver, senders, args, mode, failed):
-    width = max(len(h.name) for h in [receiver] + senders)
-
-    # One receiver per sender, on consecutive ports starting at base_port.
-    print(f"  {dim('spawning receivers...')}")
-    receiver_handles = []
-    for i, _ in enumerate(senders):
-        port = args.base_port + i
-        receiver_handles.append(spawn_perftest(receiver, "recv", port, args, target=None))
-
-    # 4s gives the receivers time to bind and start listening before any
-    # sender tries to connect; 2s was empirically too tight under load.
-    print(f"  {dim(f'waiting {RECEIVER_BIND_DELAY}s for receivers to bind...')}")
-    time.sleep(RECEIVER_BIND_DELAY)
-
-    # Fail-fast check: if a receiver already exited, the corresponding
-    # sender will never connect. Surface it now so the user isn't waiting
-    # 30s wondering what happened.
-    for rh in receiver_handles:
-        if rh["proc"].poll() is not None:
-            failed.append((receiver.name, rh["cmd"],
-                           "receiver exited before senders connected"))
-            status_fail(receiver.name, f"receiver on :{rh['port']} died early", width)
-
-    print(f"  {dim('firing senders...')}")
-    target = f"{receiver.name}-{DEFAULT_NET_IF}"
-    sender_handles = []
-    for i, s in enumerate(senders):
-        port = args.base_port + i
-        sender_handles.append(spawn_perftest(s, "send", port, args, target=target))
-
-    streamer_stop = None
-    if mode == "interleaved":
-        streamer_stop = _start_interleaved_streamer([receiver] + senders)
-
-    # Wait for every subprocess with a generous cap.
-    cap = args.duration + HANDSHAKE_PAD
-    deadline = time.monotonic() + cap
-    all_handles = sender_handles + receiver_handles
-    for h in all_handles:
-        remaining = max(0.5, deadline - time.monotonic())
-        try:
-            h["proc"].wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            h["proc"].kill()
-            failed.append((h["host"].name, h["cmd"], f"perftest exceeded {cap}s"))
-        h["thread"].join(timeout=2)
-
-    if streamer_stop is not None:
-        streamer_stop.set()
-        # Brief moment to let final lines flush.
-        time.sleep(0.3)
-
-    # Parse summaries.
-    print()  # spacing after streamed output
-    for h in sender_handles + receiver_handles:
-        text = "".join(h["out"])
-        result = parse_perftest(text)
-        if result is None:
-            failed.append((h["host"].name, h["cmd"], "couldn't parse BW summary from output"))
-            status_fail(h["host"].name, f"{h['role']} :{h['port']} no summary", width)
-            continue
-        result.update({"port": h["port"], "role": h["role"]})
-        h["host"].perftest_results.append(result)
-        status_ok(
-            h["host"].name,
-            f"{h['role']:<6} :{h['port']}  "
-            f"avg {result['bw_avg']:>6.2f} Gb/s  "
-            f"peak {result['bw_peak']:>6.2f} Gb/s  "
-            f"{result['mpps']:>6.3f} Mpps",
-            width,
-        )
-
-
-_INTERLEAVE_COLORS = ["31", "32", "33", "34", "35", "36"]
-
-
-def _start_interleaved_streamer(hosts):
-    """Tail each host's log file and prefix lines with a colored hostname."""
-    stop = threading.Event()
-
-    def tailer(h, code):
-        try:
-            f = open(h.log_path, "r")
-        except FileNotFoundError:
-            return
-        f.seek(0, os.SEEK_END)
-        prefix = _c(f"{h.name:>14}", code) + " │ "
-        while not stop.is_set():
-            line = f.readline()
-            if not line:
-                time.sleep(0.05)
-                continue
-            sys.stdout.write(prefix + line)
-            sys.stdout.flush()
-        f.close()
-
-    for i, h in enumerate(hosts):
-        t = threading.Thread(
-            target=tailer,
-            args=(h, _INTERLEAVE_COLORS[i % len(_INTERLEAVE_COLORS)]),
-            daemon=True,
-        )
-        t.start()
-    return stop
-
-
-# =============================================================================
-# Reporting
-# =============================================================================
-
-def _fmt_int(n):
-    return f"{n:,}"
-
-
-def _short(name):
-    # Strip a common prefix to keep table columns narrow. Tweak or remove
-    # if your hostnames don't share a prefix.
-    return name.replace("alveo-", "")
-
-
-def _ecn_label(tos):
-    return {0: "Not-ECT", 1: "ECT(1)", 2: "ECT(0)", 3: "CE"}[tos & 0b11]
-
-
-def write_report(path, receiver, senders, args, started_at, failed):
-    hosts = [receiver] + senders
-    L = []
-    L.append("# Incast benchmark report")
-    L.append("")
-    L.append(f"- **Timestamp:** {started_at.isoformat(timespec='seconds')}")
-    L.append(f"- **Receiver:** `{receiver.name}`")
-    L.append(f"- **Senders:** {', '.join('`' + s.name + '`' for s in senders)}")
-    L.append(
-        f"- **Duration:** {args.duration}s   "
-        f"**Message size:** {args.msg_size} B   "
-        f"**GID idx:** {args.gid_index}   "
-        f"**TOS:** {args.tos} (DSCP {args.tos >> 2}, {_ecn_label(args.tos)})"
-    )
-    L.append("")
-    L.append("## Configuration")
-    L.append("")
-    L.append("```")
-    L.append("$ " + " ".join(shlex.quote(a) for a in [Path(sys.argv[0]).name] + sys.argv[1:]))
-    L.append("```")
-    L.append("")
-
-    # Throughput
-    L.append("## Throughput")
-    L.append("")
-    L.append("| Host | Role | Port | BW avg [Gb/s] | BW peak [Gb/s] | MsgRate [Mpps] |")
-    L.append("|---|---|---:|---:|---:|---:|")
-    sender_total = 0.0
-    receiver_total = 0.0
-    for s in senders:
-        for r in s.perftest_results:
-            L.append(f"| `{s.name}` | sender | {r['port']} | "
-                     f"{r['bw_avg']:.2f} | {r['bw_peak']:.2f} | {r['mpps']:.3f} |")
-            sender_total += r["bw_avg"]
-    for r in receiver.perftest_results:
-        L.append(f"| `{receiver.name}` | receiver | {r['port']} | "
-                 f"{r['bw_avg']:.2f} | {r['bw_peak']:.2f} | {r['mpps']:.3f} |")
-        receiver_total += r["bw_avg"]
-    L.append("")
-    L.append(f"- **Aggregate sender BW:** {sender_total:.2f} Gb/s")
-    L.append(f"- **Aggregate receiver BW:** {receiver_total:.2f} Gb/s")
-    L.append("")
-
-    # Headline counters
-    L.append("## Headline counter deltas")
-    L.append("")
-    L.append("| Counter | " + " | ".join(_short(h.name) for h in hosts) + " |")
-    L.append("|---|" + "|".join(["---:"] * len(hosts)) + "|")
-    for cls, name in HEADLINE_COUNTERS:
-        row = [f"`{cls}:{name}`"]
-        for h in hosts:
-            d = diff_counters(h.pre_counters, h.post_counters)
-            v = d.get((cls, name), 0)
-            row.append(_fmt_int(v) if v else "—")
-        L.append("| " + " | ".join(row) + " |")
-    L.append("")
-
-    # Per-host details
-    L.append("## Per-host details")
-    L.append("")
-    headline_set = set(HEADLINE_COUNTERS)
+    if not Path("/Applications/iTerm.app").exists():
+        return False
     for h in hosts:
-        d = diff_counters(h.pre_counters, h.post_counters)
-        non_headline = sorted(
-            [(k, v) for k, v in d.items() if k not in headline_set],
-            key=lambda kv: -abs(kv[1]),
+        h.log_path.parent.mkdir(parents=True, exist_ok=True)
+        h.log_path.touch()
+        title = f"{h.role}: {h.short}"
+        inner = (f"clear; printf '\\033]0;{title}\\007'; "
+                 f"echo '── tailing {h.log_path} ──'; "
+                 f"tail -n +1 -F {shlex.quote(str(h.log_path))}")
+        # The string passed to AppleScript needs double-quotes escaped.
+        inner_as = inner.replace("\\", "\\\\").replace('"', '\\"')
+        title_as = title.replace('"', '\\"')
+        script = (
+            'tell application "iTerm"\n'
+            '    activate\n'
+            '    create window with default profile\n'
+            '    tell current session of current window\n'
+            f'        write text "{inner_as}"\n'
+            f'        set name to "{title_as}"\n'
+            '    end tell\n'
+            'end tell\n'
         )
-        flags = [h.role, "BlueField" if h.is_bluefield else "ConnectX"]
-        if h.is_bluefield:
-            flags.append("PCC ok" if h.pcc_available else "PCC failed")
-        L.append("<details>")
-        L.append(
-            f"<summary><strong>{h.name}</strong> "
-            f"({', '.join(flags)}) — {len(non_headline)} other non-zero deltas</summary>"
-        )
-        L.append("")
-        if non_headline:
-            L.append("| Counter | Delta |")
-            L.append("|---|---:|")
-            for (cls, name), v in non_headline:
-                L.append(f"| `{cls}:{name}` | {_fmt_int(v)} |")
-            L.append("")
-        if h.pcc_available and h.post_pcc_raw.strip():
-            L.append("**`rigi-bluefield pcc-query` (post):**")
-            L.append("")
-            L.append("```")
-            L.append(h.post_pcc_raw.strip())
-            L.append("```")
-            L.append("")
-        L.append("</details>")
-        L.append("")
-
-    # Failed commands
-    L.append("## Failed commands")
-    L.append("")
-    if failed:
-        L.append("| Host | Command | Error |")
-        L.append("|---|---|---|")
-        for host, cmd, err in failed:
-            cmd_clean = cmd.replace("|", "\\|").replace("\n", " ").strip()
-            err_clean = err.replace("|", "\\|").replace("\n", " ").strip()
-            L.append(f"| `{host}` | `{cmd_clean}` | {err_clean} |")
-    else:
-        L.append("_None._")
-    L.append("")
-
-    path.write_text("\n".join(L))
+        p = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=10)
+        if p.returncode != 0:
+            sys.stderr.write(f"  ⚠️  Failed to open iTerm2 window for {h.name}: "
+                             f"{p.stderr.strip()}\n")
+            return False
+    return True
 
 
-def write_aggregate(path, run_dirs, per_run_metrics):
-    L = ["# Incast benchmark — aggregate", ""]
-    L.append(f"**Runs:** {len(run_dirs)}")
-    L.append("")
-    if per_run_metrics:
-        keys = sorted({k for m in per_run_metrics for k in m.keys()})
-        L.append("| Metric | Mean | Stddev | Min | Max |")
-        L.append("|---|---:|---:|---:|---:|")
-        for k in keys:
-            vals = [m[k] for m in per_run_metrics if k in m]
-            if not vals:
-                continue
-            mean = statistics.mean(vals)
-            stdev = statistics.stdev(vals) if len(vals) >= 2 else 0.0
-            L.append(f"| {k} | {mean:.2f} | {stdev:.2f} | {min(vals):.2f} | {max(vals):.2f} |")
-        L.append("")
-    L.append("## Per-run reports")
-    L.append("")
-    for d in run_dirs:
-        L.append(f"- [{d.name}/report.md]({d.name}/report.md)")
-    L.append("")
-    path.write_text("\n".join(L))
+class InterleavedTailer:
+    """Stream each host's log file to stdout with a colored prefix."""
+
+    def __init__(self, hosts: list[Host]):
+        self.hosts = hosts
+        self.stop = threading.Event()
+        self.threads: list[threading.Thread] = []
+        self.print_lock = threading.Lock()
+
+    def start(self):
+        for h in self.hosts:
+            h.log_path.parent.mkdir(parents=True, exist_ok=True)
+            h.log_path.touch()
+            t = threading.Thread(target=self._tail, args=(h,), daemon=True)
+            t.start()
+            self.threads.append(t)
+
+    def stop_all(self):
+        self.stop.set()
+        time.sleep(0.3)  # let final lines flush
+
+    def _tail(self, host: Host):
+        prefix = f"{host.color}[{host.short}]{ANSI_RESET} "
+        with host.log_path.open("r") as f:
+            f.seek(0, os.SEEK_END)
+            while not self.stop.is_set():
+                line = f.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                with self.print_lock:
+                    sys.stdout.write(prefix + line)
+                    sys.stdout.flush()
 
 
-# =============================================================================
-# Terminal summary
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Report
+# -----------------------------------------------------------------------------
 
-def print_terminal_summary(receiver, senders, run_dir, failed):
-    hosts = [receiver] + senders
-    width = max(len(h.name) for h in hosts)
+def fmt_bytes(n: int) -> str:
+    """Pretty-print byte counts (port_xmit_data is in 4-byte units, but show raw)."""
+    if abs(n) >= 1_000_000_000:
+        return f"{n/1e9:.2f}G"
+    if abs(n) >= 1_000_000:
+        return f"{n/1e6:.2f}M"
+    if abs(n) >= 1_000:
+        return f"{n/1e3:.2f}K"
+    return str(n)
 
-    print()
-    print("=" * 72)
-    print(f"  RESULTS — {receiver.name}  ({len(senders)} senders)")
-    print("=" * 72)
-    print()
-    print(f"  {'Host':<{width}}  {'Role':<8}  {'Port':>5}  "
-          f"{'BW avg Gb/s':>11}  {'BW peak Gb/s':>12}  {'Mpps':>6}")
-    print(f"  {'-'*width}  {'-'*8}  {'-'*5}  {'-'*11}  {'-'*12}  {'-'*6}")
-    sender_total = 0.0
-    receiver_total = 0.0
-    for s in senders:
-        for r in s.perftest_results:
-            print(f"  {s.name:<{width}}  {'sender':<8}  {r['port']:>5}  "
-                  f"{r['bw_avg']:>11.2f}  {r['bw_peak']:>12.2f}  {r['mpps']:>6.3f}")
-            sender_total += r["bw_avg"]
-    for r in receiver.perftest_results:
-        print(f"  {receiver.name:<{width}}  {'receiver':<8}  {r['port']:>5}  "
-              f"{r['bw_avg']:>11.2f}  {r['bw_peak']:>12.2f}  {r['mpps']:>6.3f}")
-        receiver_total += r["bw_avg"]
-    print()
-    print(f"  Aggregate sender BW:    {sender_total:.2f} Gb/s")
-    print(f"  Aggregate receiver BW:  {receiver_total:.2f} Gb/s")
-    print()
-    print(f"  Non-zero headline counter deltas:")
-    any_nonzero = False
-    for cls, name in HEADLINE_COUNTERS:
-        per_host = []
+
+def build_report(*, args, hosts: list[Host], receiver: Host,
+                 receiver_results: dict[int, PerftestResult],
+                 sender_results: dict[str, PerftestResult],
+                 counter_diffs: dict[str, dict[str, int]],
+                 wall_time_s: float, run_dir: Path) -> str:
+    lines: list[str] = []
+    lines.append(f"# Incast benchmark report — {datetime.now().isoformat(timespec='seconds')}")
+    lines.append("")
+    if args.reason:
+        lines.append(f"> **Reason:** {args.reason}")
+        lines.append("")
+    lines.append("## Configuration")
+    lines.append(f"- Receiver: **{receiver.name}** ({len(receiver_results)} server instances)")
+    lines.append(f"- Senders: " + ", ".join(f"**{s}**" for s in sender_results))
+    lines.append(f"- ib_write_bw: `-D {args.duration} -s {args.msg_size} "
+                 f"-x {args.gid_index} --report_gbits`")
+    lines.append(f"- Base port: {args.base_port}  →  ports "
+                 f"{args.base_port}..{args.base_port + len(sender_results) - 1}")
+    lines.append(f"- Wall-clock: {wall_time_s:.1f}s")
+    lines.append(f"- Logs: `{run_dir}`")
+    lines.append("")
+
+    # Throughput table
+    lines.append("## Throughput")
+    lines.append("")
+    lines.append("| Host | Role | Port | BW avg (Gb/s) | BW peak (Gb/s) | Msg rate (Mpps) |")
+    lines.append("|------|------|-----:|--------------:|---------------:|----------------:|")
+    total_sender = 0.0
+    total_receiver = 0.0
+    for s_name, sr in sender_results.items():
+        avg = f"{sr.bw_avg_gbps:.2f}" if sr.bw_avg_gbps is not None else "—"
+        peak = f"{sr.bw_peak_gbps:.2f}" if sr.bw_peak_gbps is not None else "—"
+        mpps = f"{sr.msg_rate_mpps:.2f}" if sr.msg_rate_mpps is not None else "—"
+        if sr.bw_avg_gbps:
+            total_sender += sr.bw_avg_gbps
+        err = f"  ⚠️ {sr.error}" if sr.error else ""
+        lines.append(f"| {s_name} | sender | {sr.port} | {avg} | {peak} | {mpps} |{err}")
+    for p, rr in sorted(receiver_results.items()):
+        avg = f"{rr.bw_avg_gbps:.2f}" if rr.bw_avg_gbps is not None else "—"
+        peak = f"{rr.bw_peak_gbps:.2f}" if rr.bw_peak_gbps is not None else "—"
+        mpps = f"{rr.msg_rate_mpps:.2f}" if rr.msg_rate_mpps is not None else "—"
+        if rr.bw_avg_gbps:
+            total_receiver += rr.bw_avg_gbps
+        lines.append(f"| {receiver.name} | receiver | {p} | {avg} | {peak} | {mpps} |")
+    lines.append("")
+    lines.append(f"**Aggregate sender BW: {total_sender:.2f} Gb/s · "
+                 f"Aggregate receiver BW: {total_receiver:.2f} Gb/s**")
+    lines.append("")
+
+    # Headline counters table
+    lines.append("## Headline counter deltas (Δ pre→post)")
+    lines.append("")
+    headline_pairs = (
+        [("hw__" + n, n) for n in HEADLINE_HW] +
+        [("ethtool__" + n, n) for n in HEADLINE_ETHTOOL] +
+        [("ib__" + n, n) for n in HEADLINE_IB]
+    )
+    cols = "| Counter | " + " | ".join(h.short for h in hosts) + " |"
+    sep = "|---|" + "|".join("---:" for _ in hosts) + "|"
+    lines.append(cols)
+    lines.append(sep)
+    for key, label in headline_pairs:
+        cells = []
         for h in hosts:
-            d = diff_counters(h.pre_counters, h.post_counters)
-            v = d.get((cls, name), 0)
-            if v:
-                per_host.append(f"{_short(h.name)}={_fmt_int(v)}")
-        if per_host:
-            any_nonzero = True
-            label = f"{cls}:{name}"
-            print(f"    {label:<32}  {', '.join(per_host)}")
-    if not any_nonzero:
-        print(f"    {dim('(all zero — sanity-check your TOS / DSCP-trust setup)')}")
-    print()
-    if failed:
-        print(f"  {yellow(f'{len(failed)} command(s) failed')} "
-              f"— see report.md → 'Failed commands'")
-        print()
-    print(f"  Full report:  {run_dir / 'report.md'}")
-    print(f"  Raw logs:     {run_dir}/")
-    print("=" * 72)
+            v = counter_diffs.get(h.name, {}).get(key, 0)
+            if v == 0:
+                cells.append(".")
+            elif "data" in label:
+                cells.append(fmt_bytes(v))
+            else:
+                cells.append(f"{v:,}")
+        lines.append(f"| `{label}` | " + " | ".join(cells) + " |")
+    lines.append("")
+
+    # PCC counters (BlueField only)
+    bf_hosts = [h for h in hosts if h.is_bluefield]
+    if bf_hosts:
+        pcc_keys = sorted({k for h in bf_hosts
+                           for k in counter_diffs.get(h.name, {})
+                           if k.startswith("pcc__")})
+        nonzero_pcc = [k for k in pcc_keys
+                       if any(counter_diffs.get(h.name, {}).get(k, 0) != 0
+                              for h in bf_hosts)]
+        if nonzero_pcc:
+            lines.append("## PCC counter deltas (BlueField hosts)")
+            lines.append("")
+            cols = "| Counter | " + " | ".join(h.short for h in bf_hosts) + " |"
+            sep = "|---|" + "|".join("---:" for _ in bf_hosts) + "|"
+            lines.append(cols)
+            lines.append(sep)
+            for k in nonzero_pcc:
+                cells = []
+                for h in bf_hosts:
+                    v = counter_diffs.get(h.name, {}).get(k, 0)
+                    cells.append(f"{v:,}" if v else ".")
+                lines.append(f"| `{k.removeprefix('pcc__')}` | " + " | ".join(cells) + " |")
+            lines.append("")
+
+    # Other non-zero deltas (collapsed per host)
+    other_sections = []
+    headline_keys = {k for k, _ in headline_pairs}
+    for h in hosts:
+        deltas = counter_diffs.get(h.name, {})
+        extras = sorted((k, v) for k, v in deltas.items()
+                        if k not in headline_keys and not k.startswith("pcc__"))
+        if extras:
+            other_sections.append((h, extras))
+    if other_sections:
+        lines.append("## Other non-zero deltas (per host)")
+        lines.append("")
+        for h, extras in other_sections:
+            lines.append(f"<details><summary><b>{h.name}</b> "
+                         f"({len(extras)} counters changed)</summary>")
+            lines.append("")
+            lines.append("| Counter | Δ |")
+            lines.append("|---|---:|")
+            for k, v in extras:
+                lines.append(f"| `{k}` | {v:,} |")
+            lines.append("")
+            lines.append("</details>")
+            lines.append("")
+
+    return "\n".join(lines)
 
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Main
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="RoCEv2 incast orchestrator for Mellanox BF3 / ConnectX fleets.",
+    ap = argparse.ArgumentParser(
+        description="RDMA incast benchmark orchestrator (ETHZ Systems Group)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-r", "--receiver", required=True, help="Receiver hostname")
-    p.add_argument("-s", "--senders", required=True, nargs="+",
-                   help="Sender hostnames (one or more)")
-    p.add_argument("-D", "--duration", type=int, default=30,
-                   help="ib_write_bw duration in seconds")
-    p.add_argument("-S", "--msg-size", type=int, default=65536,
-                   help="ib_write_bw message size in bytes")
-    p.add_argument("-x", "--gid-index", type=int, default=3, help="RoCEv2 GID index")
-    p.add_argument("--base-port", type=int, default=18515,
-                   help="First TCP port; one per sender")
-    p.add_argument("--runs", type=int, default=1,
-                   help="Repeat N times for mean ± stddev (nested in run-NN/ subdirs)")
-    p.add_argument("--user", default=os.environ.get("USER", "root"), help="SSH user")
-    p.add_argument("--skip-baseline", action="store_true",
-                   help="Skip rigi-bluefield baseline configuration")
-    p.add_argument("--mode", choices=["auto", "iterm2", "interleaved"], default="auto",
-                   help="Live-output mode")
-    p.add_argument("--bluefield-hosts", default=",".join(DEFAULT_BLUEFIELD_HOSTS),
-                   help="Comma-separated allowlist of BlueField-3 hosts")
-    p.add_argument("--tos", type=int, default=105,
-                   help="IP TOS for ib_write_bw -R --tos (default 105 = "
-                        "DSCP 26 << 2 | ECT(1); see README)")
-    return p.parse_args()
+    ap.add_argument("-r", "--receiver", required=True,
+                    help="Receiver hostname (e.g. alveo-u50d-02)")
+    ap.add_argument("-s", "--senders", required=True, nargs="+",
+                    help="Sender hostnames (e.g. alveo-u50d-01 alveo-u55c-05)")
+    ap.add_argument("-D", "--duration", type=int, default=DEFAULT_DURATION,
+                    help="ib_write_bw duration in seconds")
+    ap.add_argument("-S", "--msg-size", type=int, default=DEFAULT_MSG_SIZE,
+                    help="ib_write_bw message size in bytes")
+    ap.add_argument("-x", "--gid-index", type=int, default=DEFAULT_GID_INDEX,
+                    help="RoCEv2 GID index")
+    ap.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT,
+                    help="First TCP port for ib_write_bw; ports increment per sender")
+    ap.add_argument("-m", "--reason", default="",
+                    help="Why you're running this benchmark (appears in report + directory name)")
+    ap.add_argument("--runs", type=int, default=1,
+                    help="Number of repeated identical runs (mean ± stddev summary)")
+    ap.add_argument("--user", default=DEFAULT_USER, help="SSH user")
+    ap.add_argument("--domain", default=DEFAULT_DOMAIN,
+                    help="DNS domain to append to hostnames (empty = rely on DNS search domain)")
+    ap.add_argument("--skip-baseline", action="store_true",
+                    help="Skip the baseline configuration step")
+    ap.add_argument("--mode", choices=["auto", "iterm2", "interleaved"], default="auto",
+                    help="Visibility mode (auto picks iTerm2 on macOS if available)")
+    return ap.parse_args()
 
 
-def run_once(args, bf_set, run_dir, started_at):
-    receiver = Host(name=args.receiver, user=args.user,
-                    is_bluefield=args.receiver in bf_set, role="receiver")
-    senders = [Host(name=h, user=args.user, is_bluefield=h in bf_set, role="sender")
-               for h in args.senders]
-    hosts = [receiver] + senders
+def make_host(name: str, role: str, run_dir: Path,
+              user: str, domain: str, color: str) -> Host:
+    return Host(
+        name=name, role=role, user=user, domain=domain,
+        log_path=run_dir / f"{name}.log",
+        ctrl_path=SSH_CTRL_DIR / f"cm-{name}.sock",
+        color=color,
+    )
 
-    ctrl_dir = _ssh_ctrl_dir()
-    for h in hosts:
-        h.ssh = SSHTarget(host=h.name, user=h.user, ctrl_path=ctrl_dir / h.name)
-        h.log_path = run_dir / f"{h.name}.log"
-        h.log_path.touch()
 
-    failed = []
-    interrupted = False
+def run_one_iteration(args, run_dir: Path, run_idx: int, total_runs: int):
+    SSH_CTRL_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build host list (receiver gets a distinct color)
+    receiver = make_host(args.receiver, "receiver", run_dir,
+                         args.user, args.domain, ANSI_COLORS[0])
+    senders = [
+        make_host(name, "sender", run_dir, args.user, args.domain,
+                  ANSI_COLORS[(i + 1) % len(ANSI_COLORS)])
+        for i, name in enumerate(args.senders)
+    ]
+    all_hosts = [receiver] + senders
+
+    print(f"\n{'='*72}")
+    print(f"  Run {run_idx+1}/{total_runs}  →  {run_dir}")
+    if args.reason:
+        print(f"  Reason: {args.reason}")
+    print(f"{'='*72}\n")
+
+    # Phase 1 — open ControlMaster connections
+    print("[1/7] Opening SSH ControlMaster connections...")
+    with ThreadPoolExecutor(max_workers=len(all_hosts)) as ex:
+        futs = {h.name: ex.submit(open_master, h) for h in all_hosts}
+        for name, fut in futs.items():
+            try:
+                fut.result()
+                print(f"      ✓ {name}")
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                raise
+
+    # Phase 2 — detect capabilities
+    print("\n[2/7] Detecting BlueField vs ConnectX, checking rigi-bluefield...")
+    with ThreadPoolExecutor(max_workers=len(all_hosts)) as ex:
+        for h, (is_bf, has_rigi) in zip(all_hosts, ex.map(detect_capabilities, all_hosts)):
+            h.is_bluefield = is_bf
+            h.has_rigi = has_rigi
+            kind = "BlueField" if is_bf else "ConnectX"
+            rigi = "✓ rigi" if has_rigi else "✗ no rigi-bluefield (baseline will be skipped)"
+            print(f"      {h.name}: {kind}, {rigi}")
+
+    # Phase 3 — visibility windows
+    print("\n[3/7] Opening visibility windows...")
+    mode = args.mode
+    if mode == "auto":
+        mode = "iterm2" if sys.platform == "darwin" else "interleaved"
+    tailer = None
+    if mode == "iterm2":
+        if open_iterm2_windows(all_hosts):
+            print("      ✓ iTerm2 windows opened (one per host).")
+        else:
+            print("      iTerm2 unavailable — falling back to interleaved mode.")
+            mode = "interleaved"
+    if mode == "interleaved":
+        tailer = InterleavedTailer(all_hosts)
+        tailer.start()
+        print("      ✓ Streaming logs to this terminal with [host] prefixes.")
 
     try:
-        print_phase(1, 7, "Opening SSH ControlMaster connections...")
-        phase_open_ssh(hosts)
-
-        print_phase(2, 7, "Cleaning up any stale ib_write_bw on all hosts...")
-        phase_pkill_stale(hosts, label="cleared")
-
-        print_phase(3, 7, "Opening visibility windows...")
-        mode = phase_visibility(hosts, args.mode)
-
-        print_phase(4, 7, "Applying baseline configuration on all hosts...")
-        if args.skip_baseline:
-            print(f"  {dim('skipped (--skip-baseline)')}")
+        # Phase 4 — baseline
+        if not args.skip_baseline:
+            print("\n[4/7] Applying baseline configuration on all hosts...")
+            with ThreadPoolExecutor(max_workers=len(all_hosts)) as ex:
+                results = list(ex.map(apply_baseline, all_hosts))
+            ok_count = sum(1 for r in results if r)
+            print(f"      ✓ {ok_count}/{len(all_hosts)} hosts fully configured "
+                  f"(see per-host logs for any warnings).")
         else:
-            phase_baseline(hosts, failed)
+            print("\n[4/7] Skipping baseline (--skip-baseline).")
 
-        print_phase(5, 7, "Snapshotting counters (pre)...")
-        phase_snapshot(hosts, "pre", failed)
+        # Phase 5 — counter snapshot (pre)
+        print("\n[5/7] Snapshotting counters (pre)...")
+        with ThreadPoolExecutor(max_workers=len(all_hosts)) as ex:
+            pre_snaps = dict(zip(
+                [h.name for h in all_hosts],
+                ex.map(lambda h: snapshot_counters(h, "pre"), all_hosts),
+            ))
+        for name, snap in pre_snaps.items():
+            print(f"      ✓ {name}: {len(snap)} counters captured")
 
-        print_phase(6, 7,
-                    f"Running benchmark: {len(senders)} senders → {receiver.name}, "
-                    f"ports {args.base_port}..{args.base_port + len(senders) - 1}, "
-                    f"{args.duration}s + handshake...")
-        phase_run(receiver, senders, args, mode, failed)
+        # Phase 6 — run benchmark
+        ports = [args.base_port + i for i in range(len(senders))]
+        sender_to_port = dict(zip([s.name for s in senders], ports))
+        receiver_addr = receiver.name + DATA_SUFFIX
+        print(f"\n[6/7] Running benchmark: {len(senders)} senders → "
+              f"{receiver.name} ({receiver_addr}), ports {ports[0]}..{ports[-1]}, "
+              f"{args.duration}s + handshake...")
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=1 + len(senders)) as ex:
+            recv_future = ex.submit(run_receiver, receiver, ports, args)
+            time.sleep(2)  # let receivers bind
+            sender_futures = {
+                s.name: ex.submit(run_sender, s, sender_to_port[s.name],
+                                  receiver_addr, args)
+                for s in senders
+            }
+            sender_results = {name: f.result() for name, f in sender_futures.items()}
+            receiver_results = recv_future.result()
+        wall_s = time.time() - t0
+        print(f"      ✓ Done in {wall_s:.1f}s.")
 
-        print_phase(7, 7, "Snapshotting counters (post)...")
-        phase_snapshot(hosts, "post", failed)
+        # Phase 7 — counter snapshot (post)
+        print("\n[7/7] Snapshotting counters (post)...")
+        with ThreadPoolExecutor(max_workers=len(all_hosts)) as ex:
+            post_snaps = dict(zip(
+                [h.name for h in all_hosts],
+                ex.map(lambda h: snapshot_counters(h, "post"), all_hosts),
+            ))
+        counter_diffs = {
+            name: diff_counters(pre_snaps[name], post_snaps[name])
+            for name in pre_snaps
+        }
 
-    except KeyboardInterrupt:
-        interrupted = True
-        print(red("\n\nInterrupted; bailing without writing report."))
-    except SSHError as e:
-        # Don't double-print; phase_open_ssh already showed each host.
-        print(red(f"\nFatal: {e}"))
-        return 1, {}, None, [], failed
-    except RuntimeError as e:
-        print(red(f"\nFatal: {e}"))
-        return 1, {}, None, [], failed
-    except Exception as e:
-        print(red(f"\nUnexpected: {type(e).__name__}: {e}"))
-        return 1, {}, None, [], failed
+        report = build_report(
+            args=args, hosts=all_hosts, receiver=receiver,
+            receiver_results=receiver_results, sender_results=sender_results,
+            counter_diffs=counter_diffs, wall_time_s=wall_s, run_dir=run_dir,
+        )
+        report_path = run_dir / "report.md"
+        report_path.write_text(report)
+
     finally:
-        # Critical cleanup ordering:
-        #   1. pkill ib_write_bw on every host so receivers don't outlive
-        #      their parent SSH session and block the listen ports next run.
-        #   2. THEN tear down ControlMaster.
-        # Reversing the order means the pkill never reaches the host.
-        try:
-            phase_pkill_stale(hosts, label="post-run cleanup")
-        except Exception:
-            pass
-        for h in hosts:
-            try:
-                h.ssh.close_master()
-            except Exception:
-                pass
+        if tailer is not None:
+            tailer.stop_all()
+        for h in all_hosts:
+            close_master(h)
 
-    if interrupted:
-        return 130, {}, None, [], failed
+    print("\n" + "=" * 72)
+    print(report)
+    print("=" * 72)
+    print(f"\nReport saved to {report_path}")
+    print(f"Raw logs in    {run_dir}\n")
 
-    write_report(run_dir / "report.md", receiver, senders, args, started_at, failed)
-
-    sender_total = sum(r["bw_avg"] for s in senders for r in s.perftest_results)
-    receiver_total = sum(r["bw_avg"] for r in receiver.perftest_results)
-    metrics = {
-        "agg_sender_gbps": sender_total,
-        "agg_receiver_gbps": receiver_total,
-    }
-    return 0, metrics, receiver, senders, failed
+    return sender_results, receiver_results, run_dir
 
 
-def main():
+def main() -> int:
     args = parse_args()
-    bf_set = {h.strip() for h in args.bluefield_hosts.split(",") if h.strip()}
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    runs_root = Path.cwd() / "runs" / timestamp
-    runs_root.mkdir(parents=True, exist_ok=True)
+    iteration_summaries = []
 
-    if args.runs == 1:
-        rc, _, receiver, senders, failed = run_once(args, bf_set, runs_root, datetime.now())
-        if rc == 0:
-            print_terminal_summary(receiver, senders, runs_root, failed)
-        sys.exit(rc)
+    # Build a slug from the reason for the directory name
+    reason_slug = ""
+    if args.reason:
+        slug = re.sub(r'[^a-zA-Z0-9]+', '-', args.reason).strip('-').lower()[:60]
+        if slug:
+            reason_slug = f"--{slug}"
 
-    # Multi-run
-    per_run_metrics = []
-    run_dirs = []
-    for n in range(1, args.runs + 1):
-        sub = runs_root / f"run-{n:02d}"
-        sub.mkdir(parents=True, exist_ok=True)
-        run_dirs.append(sub)
-        print(bold(f"\n=== Run {n}/{args.runs} ==="))
-        rc, metrics, receiver, senders, failed = run_once(args, bf_set, sub, datetime.now())
-        if rc != 0:
-            print(red(f"\nRun {n} aborted; bailing."))
-            sys.exit(rc)
-        per_run_metrics.append(metrics)
-        print_terminal_summary(receiver, senders, sub, failed)
-    write_aggregate(runs_root / "aggregate.md", run_dirs, per_run_metrics)
-    print(f"\n{bold('Aggregate report:')} {runs_root / 'aggregate.md'}")
-    sys.exit(0)
+    for run_idx in range(args.runs):
+        run_label = timestamp if args.runs == 1 else f"{timestamp}-run{run_idx+1}"
+        run_label += reason_slug
+        run_dir = RUNS_DIR / run_label
+        try:
+            sender_results, receiver_results, _ = run_one_iteration(
+                args, run_dir, run_idx, args.runs,
+            )
+        except RuntimeError as e:
+            sys.stderr.write(str(e))
+            return 2
+        iteration_summaries.append((sender_results, receiver_results))
+
+    # Multi-run summary
+    if args.runs > 1:
+        print("=" * 72)
+        print(f"  Cross-run summary ({args.runs} runs)")
+        print("=" * 72)
+        per_sender_bws: dict[str, list[float]] = {}
+        for srs, _ in iteration_summaries:
+            for name, sr in srs.items():
+                if sr.bw_avg_gbps is not None:
+                    per_sender_bws.setdefault(name, []).append(sr.bw_avg_gbps)
+        print()
+        print(f"{'Sender':<22} {'mean (Gb/s)':>14} {'stddev':>10} "
+              f"{'min':>8} {'max':>8}")
+        print("-" * 64)
+        for name, bws in per_sender_bws.items():
+            mean = sum(bws) / len(bws)
+            var = sum((b - mean) ** 2 for b in bws) / len(bws)
+            std = var ** 0.5
+            print(f"{name:<22} {mean:>14.2f} {std:>10.2f} "
+                  f"{min(bws):>8.2f} {max(bws):>8.2f}")
+        print()
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\n\nInterrupted.\n")
+        sys.exit(130)
