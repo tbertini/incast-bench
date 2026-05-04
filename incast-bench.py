@@ -648,6 +648,132 @@ def build_report(*, args, hosts: list[Host], receiver: Host,
     return "\n".join(lines)
 
 
+def _stats(values: list[float]) -> dict[str, float]:
+    """Return mean / stddev / min / max / median for a list of floats."""
+    if not values:
+        return {"mean": 0.0, "stddev": 0.0, "min": 0.0, "max": 0.0, "median": 0.0, "n": 0}
+    n = len(values)
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / n
+    stddev = var ** 0.5
+    sorted_v = sorted(values)
+    if n % 2 == 1:
+        median = sorted_v[n // 2]
+    else:
+        median = (sorted_v[n // 2 - 1] + sorted_v[n // 2]) / 2
+    return {"mean": mean, "stddev": stddev, "min": min(values),
+            "max": max(values), "median": median, "n": n}
+
+
+def _jain_fairness(values: list[float]) -> float:
+    """Jain's fairness index: (sum)^2 / (n * sum_sq). 1.0 = perfectly fair."""
+    if not values:
+        return 0.0
+    s = sum(values)
+    ssq = sum(v * v for v in values)
+    if ssq == 0:
+        return 0.0
+    return (s * s) / (len(values) * ssq)
+
+
+def build_summary_report(*, args, run_dir: Path,
+                         iteration_summaries: list,
+                         total_wall_s: float) -> str:
+    """Cross-run summary markdown for --runs N (N > 1).
+
+    iteration_summaries: list of (sender_results dict, receiver_results dict) tuples.
+    """
+    lines: list[str] = []
+    n = len(iteration_summaries)
+
+    lines.append(f"# Cross-run summary — {datetime.now().isoformat(timespec='seconds')}")
+    lines.append("")
+    if args.reason:
+        lines.append(f"> **Reason:** {args.reason}")
+        lines.append("")
+
+    # --- Configuration block (mostly mirrors per-run report headers) ---
+    senders = list(iteration_summaries[0][0].keys())
+    n_recv_ports = len(iteration_summaries[0][1])
+    lines.append("## Configuration")
+    lines.append(f"- Receiver: **{args.receiver}** ({n_recv_ports} server instances)")
+    lines.append(f"- Senders: " + ", ".join(f"**{s}**" for s in senders))
+    lines.append(f"- ib_write_bw: `-D {args.duration} -s {args.msg_size} "
+                 f"-x {args.gid_index} --report_gbits`")
+    if args.stagger_stop > 0:
+        keep = args.keep_running or senders[0]
+        lines.append(f"- Stagger-stop: `{keep}` runs for {args.duration}s; "
+                     f"other senders run for {args.duration - args.stagger_stop}s "
+                     f"(stop {args.stagger_stop}s early)")
+    lines.append(f"- Base port: {args.base_port}  →  ports "
+                 f"{args.base_port}..{args.base_port + len(senders) - 1}")
+    lines.append(f"- **Runs:** {n}")
+    lines.append(f"- Total wall-clock: {total_wall_s:.1f}s")
+    lines.append(f"- Logs: `{run_dir}`")
+    lines.append("")
+
+    # --- Per-run snapshot table ---
+    lines.append("## Per-run results")
+    lines.append("")
+    header = "| Run | " + " | ".join(f"{s} (Gb/s)" for s in senders) + " | Aggregate (Gb/s) | Jain |"
+    sep = "|---:|" + "|".join("---:" for _ in senders) + "|---:|---:|"
+    lines.append(header)
+    lines.append(sep)
+    aggregates: list[float] = []
+    fairness_indices: list[float] = []
+    per_sender_bws: dict[str, list[float]] = {s: [] for s in senders}
+    for run_idx, (srs, _rrs) in enumerate(iteration_summaries, start=1):
+        bws = []
+        cells = []
+        for s in senders:
+            v = srs.get(s)
+            bw = v.bw_avg_gbps if (v is not None and v.bw_avg_gbps is not None) else None
+            if bw is not None:
+                bws.append(bw)
+                per_sender_bws[s].append(bw)
+                cells.append(f"{bw:.2f}")
+            else:
+                cells.append("—")
+        agg = sum(bws)
+        aggregates.append(agg)
+        fair = _jain_fairness(bws) if len(bws) >= 2 else 1.0
+        fairness_indices.append(fair)
+        lines.append(f"| {run_idx} | " + " | ".join(cells) + f" | {agg:.2f} | {fair:.3f} |")
+    lines.append("")
+
+    # --- Cross-run statistics ---
+    lines.append("## Cross-run statistics")
+    lines.append("")
+    lines.append("| Metric | mean | stddev | min | max | median | n |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for s in senders:
+        st = _stats(per_sender_bws[s])
+        lines.append(f"| `{s}` BW (Gb/s) | {st['mean']:.2f} | {st['stddev']:.2f} | "
+                     f"{st['min']:.2f} | {st['max']:.2f} | {st['median']:.2f} | "
+                     f"{st['n']} |")
+    st_agg = _stats(aggregates)
+    lines.append(f"| **Aggregate (Gb/s)** | {st_agg['mean']:.2f} | {st_agg['stddev']:.2f} | "
+                 f"{st_agg['min']:.2f} | {st_agg['max']:.2f} | {st_agg['median']:.2f} | "
+                 f"{st_agg['n']} |")
+    st_fair = _stats(fairness_indices)
+    lines.append(f"| **Jain's fairness index** | {st_fair['mean']:.3f} | {st_fair['stddev']:.3f} | "
+                 f"{st_fair['min']:.3f} | {st_fair['max']:.3f} | {st_fair['median']:.3f} | "
+                 f"{st_fair['n']} |")
+    lines.append("")
+    lines.append("Jain's fairness index = (Σ x)² / (n · Σ x²). 1.0 means perfect equal split; "
+                 "1/n means a single sender takes everything. With 2 senders, 0.5 = max unfair.")
+    lines.append("")
+
+    # --- Per-run report links ---
+    lines.append("## Per-run reports")
+    lines.append("")
+    for run_idx in range(1, n + 1):
+        lines.append(f"- [Run {run_idx}](run{run_idx}-report.md)")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -692,25 +818,29 @@ def parse_args():
 
 
 def make_host(name: str, role: str, run_dir: Path,
-              user: str, domain: str, color: str) -> Host:
+              user: str, domain: str, color: str,
+              file_prefix: str = "") -> Host:
     return Host(
         name=name, role=role, user=user, domain=domain,
-        log_path=run_dir / f"{name}.log",
+        log_path=run_dir / f"{file_prefix}{name}.log",
         ctrl_path=SSH_CTRL_DIR / f"cm-{name}.sock",
         color=color,
     )
 
 
-def run_one_iteration(args, run_dir: Path, run_idx: int, total_runs: int):
+def run_one_iteration(args, run_dir: Path, run_idx: int, total_runs: int,
+                      file_prefix: str = ""):
     SSH_CTRL_DIR.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Build host list (receiver gets a distinct color)
     receiver = make_host(args.receiver, "receiver", run_dir,
-                         args.user, args.domain, ANSI_COLORS[0])
+                         args.user, args.domain, ANSI_COLORS[0],
+                         file_prefix=file_prefix)
     senders = [
         make_host(name, "sender", run_dir, args.user, args.domain,
-                  ANSI_COLORS[(i + 1) % len(ANSI_COLORS)])
+                  ANSI_COLORS[(i + 1) % len(ANSI_COLORS)],
+                  file_prefix=file_prefix)
         for i, name in enumerate(args.senders)
     ]
     all_hosts = [receiver] + senders
@@ -748,6 +878,12 @@ def run_one_iteration(args, run_dir: Path, run_idx: int, total_runs: int):
     mode = args.mode
     if mode == "auto":
         mode = "iterm2" if sys.platform == "darwin" else "interleaved"
+    # Multi-run: skip iTerm2 windows (would open N sets, each tailing a finished log).
+    # Stream everything into the orchestrator's terminal so the user can scroll the
+    # full sequence in one place.
+    if total_runs > 1 and mode == "iterm2":
+        print("      Multi-run mode: forcing interleaved (avoids opening N sets of windows).")
+        mode = "interleaved"
     tailer = None
     if mode == "iterm2":
         if open_iterm2_windows(all_hosts):
@@ -849,7 +985,7 @@ def run_one_iteration(args, run_dir: Path, run_idx: int, total_runs: int):
             receiver_results=receiver_results, sender_results=sender_results,
             counter_diffs=counter_diffs, wall_time_s=wall_s, run_dir=run_dir,
         )
-        report_path = run_dir / "report.md"
+        report_path = run_dir / f"{file_prefix}report.md"
         report_path.write_text(report)
 
     finally:
@@ -879,21 +1015,27 @@ def main() -> int:
         if slug:
             reason_slug = f"--{slug}"
 
+    # Single shared directory for all runs (multi-run mode prepends run<N>- to file names).
+    run_dir = RUNS_DIR / f"{timestamp}{reason_slug}"
+
+    t_total = time.time()
     for run_idx in range(args.runs):
-        run_label = timestamp if args.runs == 1 else f"{timestamp}-run{run_idx+1}"
-        run_label += reason_slug
-        run_dir = RUNS_DIR / run_label
+        # Per-run file prefix; empty in single-run mode so behavior matches old layout
+        # (report.md, alveo-u50d-01.log, ...). Multi-run uses run1-, run2-, ...
+        file_prefix = "" if args.runs == 1 else f"run{run_idx+1}-"
         try:
             sender_results, receiver_results, _ = run_one_iteration(
-                args, run_dir, run_idx, args.runs,
+                args, run_dir, run_idx, args.runs, file_prefix=file_prefix,
             )
         except RuntimeError as e:
             sys.stderr.write(str(e))
             return 2
         iteration_summaries.append((sender_results, receiver_results))
+    total_wall_s = time.time() - t_total
 
     # Multi-run summary
     if args.runs > 1:
+        # Console summary
         print("=" * 72)
         print(f"  Cross-run summary ({args.runs} runs)")
         print("=" * 72)
@@ -907,12 +1049,35 @@ def main() -> int:
               f"{'min':>8} {'max':>8}")
         print("-" * 64)
         for name, bws in per_sender_bws.items():
-            mean = sum(bws) / len(bws)
-            var = sum((b - mean) ** 2 for b in bws) / len(bws)
-            std = var ** 0.5
-            print(f"{name:<22} {mean:>14.2f} {std:>10.2f} "
-                  f"{min(bws):>8.2f} {max(bws):>8.2f}")
+            st = _stats(bws)
+            print(f"{name:<22} {st['mean']:>14.2f} {st['stddev']:>10.2f} "
+                  f"{st['min']:>8.2f} {st['max']:>8.2f}")
+        # Aggregate row
+        aggregates = [sum(sr.bw_avg_gbps for sr in srs.values()
+                          if sr.bw_avg_gbps is not None)
+                      for srs, _ in iteration_summaries]
+        st_agg = _stats(aggregates)
+        print(f"{'<aggregate>':<22} {st_agg['mean']:>14.2f} {st_agg['stddev']:>10.2f} "
+              f"{st_agg['min']:>8.2f} {st_agg['max']:>8.2f}")
+        # Jain's fairness across runs
+        fairness = [_jain_fairness([sr.bw_avg_gbps for sr in srs.values()
+                                    if sr.bw_avg_gbps is not None])
+                    for srs, _ in iteration_summaries]
+        st_fair = _stats(fairness)
+        print(f"{'<jain fairness>':<22} {st_fair['mean']:>14.3f} {st_fair['stddev']:>10.3f} "
+              f"{st_fair['min']:>8.3f} {st_fair['max']:>8.3f}")
         print()
+
+        # Markdown summary report (same folder, top-level report.md)
+        summary = build_summary_report(
+            args=args, run_dir=run_dir,
+            iteration_summaries=iteration_summaries,
+            total_wall_s=total_wall_s,
+        )
+        summary_path = run_dir / "report.md"
+        summary_path.write_text(summary)
+        print(f"Cross-run summary written to {summary_path}")
+        print(f"Per-run reports: {run_dir}/run<N>-report.md\n")
 
     return 0
 
